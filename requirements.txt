@@ -1,5 +1,6 @@
 # 핵심
 torch>=2.3          # trainer가 사용하는 torch.amp.GradScaler / autocast API
+torchvision>=0.20   # 이미지 로딩/전처리 (io.read_image, transforms) — MMT용. backbone(models)은 미사용
 numpy>=1.24
 
 # 설정 & CLI

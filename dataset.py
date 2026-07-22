@@ -7,11 +7,12 @@
  역할:
     - `TranslationDataset`: preprocess.py가 만든 토큰 id 파일
       ({split}.ids.{src}, {split}.ids.{tgt})을 줄 단위로 짝지어 로드하고,
-      타겟에 <s>/</s>를 붙인다.
+      타겟에 <s>/</s>를 붙인다. Multimodal(use_image)이면 split별 이미지
+      리스트({split}.txt)를 함께 읽어 각 문장에 대응되는 이미지를 로드한다.
     - `collate_fn`: 배치 패딩 + teacher-forcing shift. 기존
       datasets/collate.py 의 Seq2SeqCollator 를 그대로 재사용한다
       (동일한 배치 형식을 만들기 때문) — 패딩과 shift 규칙은 그 파일에
-      상세히 문서화되어 있다.
+      상세히 문서화되어 있다. 이미지가 있으면 배치에 stack해 넣어준다.
     - `build_split_dataloader`: 활성 언어쌍의 산출물 디렉터리에서 임의의
       split 이름 하나에 대한 DataLoader를 생성한다 (test.py가 test2016 /
       test2017 / testcoco / test2018을 각각 개별적으로 평가할 때 사용).
@@ -20,18 +21,23 @@
       역할마다 호출). train.py가 학습 루프에 사용한다.
 
  입력 / 출력:
-    __getitem__(i) -> {"src": list[int], "tgt": list[int]}   (패딩 없음)
+    __getitem__(i) -> {"src": list[int], "tgt": list[int]}
+                      (+ use_image면 "image": (C, H, W) 텐서)  (패딩 없음)
     DataLoader 배치 -> {
         "src"       : (batch, max_src_len)      int64, 오른쪽 패딩
         "tgt_input" : (batch, max_tgt_len - 1)  int64  [<s>, y1, ..., yn]
         "tgt_output": (batch, max_tgt_len - 1)  int64  [y1, ..., yn, </s>]
+        "image"     : (batch, C, H, W)          float — use_image일 때만
     }
-    -> 기존 Trainer / evaluate() 가 기대하는 형식과 정확히 동일하다.
+    -> 기존 Trainer / evaluate() 가 기대하는 형식과 정확히 동일하다
+       (이미지 키는 추가될 뿐이며, move_to_device가 자동으로 디바이스로 옮김).
 
  구현 세부사항:
     - id 파일이 없으면 "python preprocess.py 먼저 실행" 안내와 함께
       FileNotFoundError를 던진다.
     - 소스/타겟 줄 수가 다르면 데이터 정렬이 깨진 것이므로 즉시 에러.
+    - 이미지 리스트({split}.txt)는 코퍼스와 줄 단위 1:1 정렬이므로, 빈
+      문장 쌍을 skip할 때 해당 이미지도 함께 제외해 정렬을 유지한다.
     - 시퀀스는 model.max_seq_length로 잘리며, 타겟은 </s>가 살아남도록
       중간을 자른다.
 ===============================================================================
@@ -40,6 +46,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -47,6 +54,7 @@ from torch.utils.data import DataLoader, Dataset
 from config.config import Config
 from datasets.collate import Seq2SeqCollator
 from utils.data_paths import ids_path, pair_dir
+from utils.image import build_image_transform, load_image_tensor, resolve_image_path
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -74,19 +82,46 @@ def _read_ids_file(path: str | Path) -> list[list[int]]:
         return [[int(tok) for tok in line.split()] for line in fh]
 
 
-class TranslationDataset(Dataset):
-    """토큰 id 파일 쌍으로 이루어진 번역 데이터셋.
-
-    소스 문장과 타겟 문장을 줄 단위로 짝지어 로드하고, 타겟에는
-    teacher forcing을 위해 [BOS ... EOS]를 붙인다. 패딩과 입력/출력
-    shift는 collate 단계(Seq2SeqCollator)에서 수행된다.
+def _read_image_list(path: str | Path) -> list[str]:
+    """split별 이미지 리스트 파일({split}.txt)을 줄 단위로 읽는다.
 
     Args:
-        src_ids_path: 소스 id 파일 (예: data/multi30k/train.ids.en).
-        tgt_ids_path: 타겟 id 파일 (예: data/multi30k/train.ids.de).
+        path: 이미지 파일명 리스트 (한 줄에 하나, "<name>.jpg" 또는
+            testcoco처럼 "<name>.jpg#id").
+
+    Returns:
+        줄마다 하나씩의 원본 문자열 (경로 해석은 resolve_image_path가 담당).
+
+    Raises:
+        FileNotFoundError: 리스트 파일이 없을 때.
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Image list not found: {path} — expected data/image/{{split}}.txt for MMT."
+        )
+    with open(path, "r", encoding="utf-8") as fh:
+        return [line.strip() for line in fh]
+
+
+class TranslationDataset(Dataset):
+    """토큰 id 파일 쌍(+ 선택적 이미지)으로 이루어진 번역 데이터셋.
+
+    소스 문장과 타겟 문장을 줄 단위로 짝지어 로드하고, 타겟에는
+    teacher forcing을 위해 [BOS ... EOS]를 붙인다. Multimodal 모드에서는
+    split별 이미지 리스트에서 각 문장에 대응되는 이미지를 함께 로드한다.
+    패딩과 입력/출력 shift는 collate 단계(Seq2SeqCollator)에서 수행된다.
+
+    Args:
+        src_ids_path: 소스 id 파일 (예: data/data-bin/en-de/train.ids.en).
+        tgt_ids_path: 타겟 id 파일 (예: data/data-bin/en-de/train.ids.de).
         bos_id: 타겟 문장 시작(<s>) id.
         eos_id: 타겟 문장 종료(</s>) id.
         max_seq_length: 시퀀스 길이 상한 (model.max_seq_length).
+        image_list_path: split별 이미지 리스트 경로 (예: data/image/train.txt).
+            None이면 텍스트-only.
+        image_dir: 이미지 루트 (raw/ 하위에 실제 파일). image_list_path와 함께 필요.
+        image_size: 정사각 리사이즈 크기 (multimodal.image_size).
     """
 
     def __init__(
@@ -96,6 +131,9 @@ class TranslationDataset(Dataset):
         bos_id: int,
         eos_id: int,
         max_seq_length: int,
+        image_list_path: Optional[str | Path] = None,
+        image_dir: Optional[str | Path] = None,
+        image_size: Optional[int] = None,
     ) -> None:
         src_lines = _read_ids_file(src_ids_path)
         tgt_lines = _read_ids_file(tgt_ids_path)
@@ -105,19 +143,36 @@ class TranslationDataset(Dataset):
                 f"but {tgt_ids_path} has {len(tgt_lines)} — corpora are misaligned."
             )
 
-        self.examples: list[dict[str, list[int]]] = []
+        # ------------------------------------------------------ 이미지 설정
+        self.use_image = image_list_path is not None
+        if self.use_image:
+            image_names = _read_image_list(image_list_path)
+            if len(image_names) != len(src_lines):
+                raise ValueError(
+                    f"Image/corpus mismatch: {image_list_path} has {len(image_names)} lines "
+                    f"but corpus has {len(src_lines)} — image list must align 1:1 with sentences."
+                )
+            self.image_dir = image_dir
+            # 매 __getitem__마다 새로 만들지 않도록 transform을 한 번만 만든다.
+            self.image_transform = build_image_transform(image_size)
+
+        self.examples: list[dict[str, object]] = []
         self.num_skipped = 0
-        for src, tgt in zip(src_lines, tgt_lines):
+        for line_index, (src, tgt) in enumerate(zip(src_lines, tgt_lines)):
             if not src or not tgt:  # 어느 한쪽이 빈 문장이면 건너뛴다
                 self.num_skipped += 1
-                continue
+                continue  # 이미지도 함께 건너뛰어 정렬을 유지한다
             # 소스: 길이 상한으로 자르기.
             src = src[:max_seq_length]
             # 타겟: [BOS ... EOS]를 붙이고, 넘치면 EOS가 살아남도록 자른다.
             tgt = [bos_id] + tgt + [eos_id]
             if len(tgt) > max_seq_length:
                 tgt = tgt[: max_seq_length - 1] + [eos_id]
-            self.examples.append({"src": src, "tgt": tgt})
+            example: dict[str, object] = {"src": src, "tgt": tgt}
+            if self.use_image:
+                # 원본 줄 인덱스로 이미지를 짝짓는다 (skip된 줄은 이미지도 제외됨).
+                example["image_path"] = resolve_image_path(self.image_dir, image_names[line_index])
+            self.examples.append(example)
 
         if not self.examples:
             raise ValueError(f"No usable sentence pairs in {src_ids_path} / {tgt_ids_path}")
@@ -127,9 +182,14 @@ class TranslationDataset(Dataset):
     def __len__(self) -> int:
         return len(self.examples)
 
-    def __getitem__(self, index: int) -> dict[str, list[int]]:
-        """(패딩 없는) 한 쌍의 id 시퀀스를 반환한다."""
-        return self.examples[index]
+    def __getitem__(self, index: int) -> dict[str, object]:
+        """(패딩 없는) 한 쌍의 id 시퀀스를 반환한다 (use_image면 이미지 텐서 포함)."""
+        example = self.examples[index]
+        if not self.use_image:
+            return example
+        # 이미지를 지연 로드한다 (전체를 메모리에 올리지 않음): (C, H, W) 텐서.
+        image = load_image_tensor(example["image_path"], transform=self.image_transform)
+        return {"src": example["src"], "tgt": example["tgt"], "image": image}
 
 
 # 배치 패딩 + teacher-forcing shift. 기존 구현을 그대로 재사용한다
@@ -164,14 +224,19 @@ def build_split_dataloader(
         해당 split의 DataLoader (평가 용도이므로 기본은 셔플 없음,
         결정적 순서 유지).
     """
-    d, t = config.dataset, config.training
+    d, t, mm = config.dataset, config.training, config.multimodal
     base_dir = pair_dir(d.bin_dir, d.src_lang, d.tgt_lang)
+    # Multimodal이면 split 이름과 동일한 이미지 리스트({split}.txt)를 함께 준다.
+    image_list_path = Path(mm.image_dir) / f"{split}.txt" if mm.use_image else None
     dataset = TranslationDataset(
         src_ids_path=ids_path(base_dir, split, d.src_lang),
         tgt_ids_path=ids_path(base_dir, split, d.tgt_lang),
         bos_id=bos_id,
         eos_id=eos_id,
         max_seq_length=config.model.max_seq_length,
+        image_list_path=image_list_path,
+        image_dir=mm.image_dir if mm.use_image else None,
+        image_size=mm.image_size if mm.use_image else None,
     )
     loader = DataLoader(
         dataset,

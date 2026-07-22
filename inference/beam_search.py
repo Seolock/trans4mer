@@ -83,11 +83,12 @@ class BeamSearchDecoder:
         return score / (((5.0 + length) / 6.0) ** self.length_penalty)
 
     @torch.no_grad()
-    def search(self, src: Tensor) -> list[list[int]]:
+    def search(self, src: Tensor, image: Tensor | None = None) -> list[list[int]]:
         """배치 내 모든 소스 시퀀스에 대해 최선의 가설을 디코딩한다.
 
         Args:
             src: ``(batch, src_len)`` 오른쪽 패딩된 소스 id.
+            image: ``(batch, C, H, W)`` 이미지 텐서 (Multimodal), 또는 None.
 
         Returns:
             예제마다 최선의 토큰-id 리스트 (BOS/EOS 제외).
@@ -104,6 +105,13 @@ class BeamSearchDecoder:
         memory = memory.repeat_interleave(beam_size, dim=0)
         memory_mask = src_mask.repeat_interleave(beam_size, dim=0)
 
+        # 이미지도 한 번만 인코딩하고 memory와 동일하게 빔 개수만큼 반복한다
+        # (같은 행 정렬 규칙을 유지해야 각 빔이 자기 이미지를 보게 된다).
+        image_memory = None
+        if image is not None:
+            image_memory = self.model.encode_image(image)
+            image_memory = image_memory.repeat_interleave(beam_size, dim=0)
+
         # ------------------------------------------------------ 빔 상태
         sequences = torch.full(
             (batch_size * beam_size, 1), self.bos_id, dtype=torch.long, device=device
@@ -119,7 +127,9 @@ class BeamSearchDecoder:
 
         for step in range(1, self.max_length + 1):
             # -------------------------------------------- 모든 빔을 확장
-            decoded = self.model.decode(sequences, memory, memory_mask=memory_mask)
+            decoded = self.model.decode(
+                sequences, memory, memory_mask=memory_mask, image_memory=image_memory
+            )
             # 이번 스텝에서는 가장 최근 위치의 분포만 중요하다.
             logits = self.model.generator(decoded[:, -1, :])
             log_probs = torch.log_softmax(logits.float(), dim=-1)  # (B*K, V)

@@ -14,12 +14,20 @@
       - 원본 토큰 id로부터 마스크(패딩 + causal) 생성.
 
  입력 / 출력:
-    forward(src, tgt):
-        src: (batch, src_len) int64 소스 토큰 id (오른쪽 패딩)
-        tgt: (batch, tgt_len) int64 타겟-prefix id (BOS로 시작)
-        ->   (batch, tgt_len, vocab_size) 정규화되지 않은 logits
-    encode()/decode()는 추론을 위해 두 부분을 각각 노출하며, 이때 소스는
-    한 번만 인코딩되고 디코더는 스텝별로 호출된다.
+    forward(src, image, tgt):
+        src:   (batch, src_len) int64 소스 토큰 id (오른쪽 패딩)
+        image: (batch, channels, H, W) 실수 이미지 텐서, 또는 None
+               (use_image가 아니거나 이미지가 없을 때 — 텍스트-only 동작)
+        tgt:   (batch, tgt_len) int64 타겟-prefix id (BOS로 시작)
+        ->     (batch, tgt_len, vocab_size) 정규화되지 않은 logits
+    encode()/encode_image()/decode()는 추론을 위해 각 부분을 노출하며, 이때
+    소스와 이미지는 한 번만 인코딩되고 디코더는 스텝별로 호출된다.
+
+ Multimodal(MMT):
+    multimodal.use_image=true면 이미지 인코더(ImageEncoder, scratch)를 하나
+    더 소유하고, 디코더가 텍스트 memory와 이미지 memory 양쪽에
+    cross-attention한 뒤 Fusion으로 합친다. use_image=false면 이미지 관련
+    모듈을 아예 만들지 않아 기존 텍스트 Transformer와 완전히 동일하다.
 
  구현 세부사항:
     - forward()에는 마스크 생성 -> 인코더 -> 디코더 -> 프로젝션의 전체
@@ -48,6 +56,7 @@ from config.config import Config
 from models.decoder import Decoder
 from models.embedding import TokenEmbedding, TransformerEmbedding
 from models.encoder import Encoder
+from models.image_encoder import ImageEncoder
 from models.positional_encoding import build_positional_encoding
 from models.utils import combine_masks, init_xavier, make_causal_mask, make_pad_mask
 
@@ -111,6 +120,13 @@ class Transformer(nn.Module):
         self.encoder = Encoder(config)
         self.decoder = Decoder(config)
 
+        # -------------------------------------------------------- 이미지 인코더
+        # use_image일 때만 scratch 이미지 인코더를 소유한다 (없으면 텍스트-only).
+        # init_xavier 이전에 만들어야 이미지 인코더 가중치도 random 초기화된다.
+        self.use_image = config.multimodal.use_image
+        if self.use_image:
+            self.image_encoder = ImageEncoder(config)
+
         # -------------------------------------------------------- generator
         # d_model에서 어휘집 logits로의 최종 프로젝션. 가중치가 묶여있을
         # 때는 그 가중치가 말 그대로 디코더 임베딩 행렬이므로(bias는
@@ -170,20 +186,43 @@ class Transformer(nn.Module):
             src_mask = self.make_source_mask(src)
         return self.encoder(self.src_embedding(src), src_mask)
 
+    def encode_image(self, image: Tensor) -> Tensor:
+        """이미지를 scratch 이미지 인코더로 patch feature 시퀀스로 인코딩한다.
+
+        추론 시 이미지도 소스처럼 한 번만 인코딩해두고 재사용하기 위한
+        공개 API다 (텍스트 encode()와 대칭).
+
+        Args:
+            image: ``(batch, channels, H, W)`` 이미지 텐서.
+
+        Returns:
+            ``(batch, num_patches, d_model)`` 이미지 memory.
+
+        Raises:
+            RuntimeError: use_image=false인 모델에서 호출된 경우.
+        """
+        if not self.use_image:
+            raise RuntimeError("encode_image() called but multimodal.use_image is false")
+        return self.image_encoder(image)
+
     def decode(
         self,
         tgt: Tensor,
         memory: Tensor,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
+        image_memory: Optional[Tensor] = None,
+        image_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """타겟 prefix를 임베딩하고 미리 계산된 memory에 대해 디코딩한다.
 
         Args:
             tgt: ``(batch, tgt_len)`` 타겟-prefix id.
-            memory: ``(batch, src_len, d_model)`` 인코더 출력.
+            memory: ``(batch, src_len, d_model)`` 텍스트 인코더 출력.
             tgt_mask: causal + 패딩이 결합된 마스크, 또는 None이면 여기서 생성.
-            memory_mask: cross-attention을 위한 소스-패딩 마스크.
+            memory_mask: 텍스트 cross-attention을 위한 소스-패딩 마스크.
+            image_memory: ``(batch, num_patches, d_model)`` 이미지 memory 또는 None.
+            image_mask: 이미지 cross-attention용 선택적 마스크 또는 None.
 
         Returns:
             ``(batch, tgt_len, d_model)`` 디코더 상태. 어휘집 logits을
@@ -191,18 +230,24 @@ class Transformer(nn.Module):
         """
         if tgt_mask is None:
             tgt_mask = self.make_target_mask(tgt)
-        return self.decoder(self.tgt_embedding(tgt), memory, tgt_mask, memory_mask)
+        return self.decoder(
+            self.tgt_embedding(tgt), memory, tgt_mask, memory_mask, image_memory, image_mask
+        )
 
     # ---------------------------------------------------------------- forward
-    def forward(self, src: Tensor, tgt: Tensor) -> Tensor:
+    def forward(self, src: Tensor, image: Optional[Tensor], tgt: Tensor) -> Tensor:
         """학습과 평가를 위한 teacher-forced forward pass.
 
         마스크 생성부터 어휘집 프로젝션까지 전체 데이터 흐름이 이 함수
-        안에 직접 작성되어 있다. (:meth:`encode` / :meth:`decode`는 추론이
-        두 절반을 따로 실행하기 위한 공개 API로 유지된다.)
+        안에 직접 작성되어 있다. (:meth:`encode` / :meth:`encode_image` /
+        :meth:`decode`는 추론이 여러 부분을 따로 실행하기 위한 공개 API로
+        유지된다.)
 
         Args:
             src: ``(batch, src_len)`` 소스 id.
+            image: ``(batch, channels, H, W)`` 이미지 텐서, 또는 None.
+                use_image=false이거나 None이면 이미지 경로를 건너뛰고
+                텍스트-only로 동작한다.
             tgt: ``(batch, tgt_len)`` 디코더 입력 id — 타겟을 오른쪽으로
                 한 칸 민 것, 즉 ``[BOS, y1, ..., y_{n-1}]``. 위치 ``t``는
                 ``y_t``를 예측하므로, 손실은 출력을 ``[y1, ..., y_n(EOS)]``와
@@ -225,12 +270,20 @@ class Transformer(nn.Module):
         src_embedded = self.src_embedding(src)
         memory = self.encoder(src_embedded, src_mask)
 
+        # 이미지 인코딩(옵션): use_image이고 이미지가 주어졌을 때만.
+        # 이미지 패치에는 패딩이 없으므로 image_mask는 None.
+        image_memory = (
+            self.encode_image(image) if (self.use_image and image is not None) else None
+        )
+
         # ===================== 3) 디코더 =====================
-        # 타겟 임베딩 -> (마스킹된 self-attn + cross-attn + FFN) 스택.
-        # cross-attention은 소스 패딩 마스크를 재사용한다: (B, 1, 1, src_len)이
-        # 모든 tgt 쿼리 위치에 걸쳐 브로드캐스트된다.
+        # 타겟 임베딩 -> (마스킹된 self-attn + Text(+Image) cross-attn +
+        # Fusion + FFN) 스택. 텍스트 cross-attention은 소스 패딩 마스크를
+        # 재사용한다: (B, 1, 1, src_len)이 모든 tgt 쿼리 위치에 브로드캐스트.
         tgt_embedded = self.tgt_embedding(tgt)
-        decoded = self.decoder(tgt_embedded, memory, tgt_mask, memory_mask=src_mask)
+        decoded = self.decoder(
+            tgt_embedded, memory, tgt_mask, memory_mask=src_mask, image_memory=image_memory
+        )
 
         # ===================== 4) 어휘집 프로젝션 =====================
         # (B, tgt_len, d_model) -> (B, tgt_len, vocab_size)

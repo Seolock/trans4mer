@@ -40,6 +40,7 @@ from inference.beam_search import BeamSearchDecoder
 from models.transformer import Transformer
 from trainer.checkpoint import CheckpointManager
 from utils.data_paths import codes_path, pair_dir, vocab_path
+from utils.image import build_image_transform, load_image_tensor
 from utils.misc import get_device
 from utils.text import remove_bpe, simple_tokenize
 from vocab import Vocab
@@ -74,6 +75,11 @@ class Translator:
         self.device = device
         # positional encoding이 지원하는 길이를 절대 넘지 않도록 한다.
         self.max_length = min(config.inference.max_length, config.model.max_seq_length - 1)
+        # Multimodal: 이미지 전처리 transform을 한 번만 만들어 재사용한다.
+        self.use_image = config.multimodal.use_image
+        self.image_transform = (
+            build_image_transform(config.multimodal.image_size) if self.use_image else None
+        )
 
     # ------------------------------------------------------------- 팩토리
     @classmethod
@@ -155,13 +161,26 @@ class Translator:
             src[row, : len(ids)] = torch.tensor(ids, dtype=torch.long, device=self.device)
         return src
 
+    def _encode_images(self, images: list[str]) -> Tensor:
+        """이미지 경로 배치를 모델 입력 텐서로 로드/전처리한다.
+
+        Args:
+            images: 이미지 파일 경로들 (texts와 인덱스 정렬).
+
+        Returns:
+            ``(batch, C, H, W)`` float 텐서 (device 위에 있음).
+        """
+        tensors = [load_image_tensor(path, transform=self.image_transform) for path in images]
+        return torch.stack(tensors, dim=0).to(self.device)
+
     # -------------------------------------------------------------- 디코딩
     @torch.no_grad()
-    def _greedy_search(self, src: Tensor) -> list[list[int]]:
+    def _greedy_search(self, src: Tensor, image: Tensor | None = None) -> list[list[int]]:
         """argmax greedy 디코딩.
 
         Args:
             src: ``(batch, src_len)`` 오른쪽 패딩된 소스 id.
+            image: ``(batch, C, H, W)`` 이미지 텐서 (Multimodal), 또는 None.
 
         Returns:
             예제마다 생성된 타겟 id 리스트 (BOS/EOS 제외).
@@ -169,15 +188,18 @@ class Translator:
         bos, eos, pad = self.tgt_vocab.bos_id, self.tgt_vocab.eos_id, self.tgt_vocab.pad_id
         batch_size = src.size(0)
 
-        # 소스는 한 번만 인코딩한다.
+        # 소스(와 이미지)는 한 번만 인코딩한다.
         src_mask = self.model.make_source_mask(src)
         memory = self.model.encode(src, src_mask)
+        image_memory = self.model.encode_image(image) if image is not None else None
 
         sequences = torch.full((batch_size, 1), bos, dtype=torch.long, device=self.device)
         alive = torch.ones(batch_size, dtype=torch.bool, device=self.device)
 
         for step in range(1, self.max_length + 1):
-            decoded = self.model.decode(sequences, memory, memory_mask=src_mask)
+            decoded = self.model.decode(
+                sequences, memory, memory_mask=src_mask, image_memory=image_memory
+            )
             logits = self.model.generator(decoded[:, -1, :]).float()
             if step <= self.config.inference.min_length:
                 logits[:, eos] = float("-inf")  # 최소 길이 강제
@@ -201,17 +223,23 @@ class Translator:
         return results
 
     # ------------------------------------------------------------ 공개 API
-    def translate_batch(self, texts: list[str]) -> list[str]:
-        """원본 문장 배치를 번역한다.
+    def translate_batch(
+        self, texts: list[str], images: Optional[list[str]] = None
+    ) -> list[str]:
+        """원본 문장 배치를 번역한다 (Multimodal이면 이미지와 함께).
 
         Args:
             texts: 소스 언어 원본 문장들.
+            images: 각 문장에 대응되는 이미지 파일 경로들 (use_image일 때).
+                None이면 이미지 없이(텍스트-only 경로로) 번역한다.
 
         Returns:
             타겟 언어 번역 문장들 (BPE 마커가 제거된 일반 텍스트).
         """
         inf = self.config.inference
         src = self._encode_batch(texts)
+        # use_image이고 이미지 경로가 주어졌을 때만 이미지 텐서를 만든다.
+        image = self._encode_images(images) if (self.use_image and images is not None) else None
 
         if inf.beam_size > 1:
             decoder = BeamSearchDecoder(
@@ -224,13 +252,14 @@ class Translator:
                 min_length=inf.min_length,
                 length_penalty=inf.length_penalty,
             )
-            outputs = decoder.search(src)
+            outputs = decoder.search(src, image=image)
         else:
-            outputs = self._greedy_search(src)
+            outputs = self._greedy_search(src, image=image)
 
         # id -> BPE 토큰 -> 문자열 -> BPE 마커 제거.
         return [remove_bpe(" ".join(self.tgt_vocab.decode(ids))) for ids in outputs]
 
-    def translate(self, text: str) -> str:
-        """문장 하나를 번역한다."""
-        return self.translate_batch([text])[0]
+    def translate(self, text: str, image: Optional[str] = None) -> str:
+        """문장 하나를 (선택적으로 이미지와 함께) 번역한다."""
+        images = [image] if image is not None else None
+        return self.translate_batch([text], images=images)[0]

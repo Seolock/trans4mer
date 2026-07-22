@@ -78,7 +78,8 @@ def evaluate(
     iterator = tqdm(dataloader, desc="evaluate", leave=False) if progress else dataloader
     for batch in iterator:
         batch = move_to_device(batch, device)
-        logits = model(batch["src"], batch["tgt_input"])
+        # batch.get("image"): Multimodal이면 (B, C, H, W), 텍스트-only면 None.
+        logits = model(batch["src"], batch.get("image"), batch["tgt_input"])
         targets = batch["tgt_output"]
 
         # (batch, seq, vocab) -> (batch*seq, vocab)으로 펼쳐서 loss를 계산.

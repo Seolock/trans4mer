@@ -235,7 +235,9 @@ class Trainer:
         targets = batch["tgt_output"]
 
         with amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
-            logits = self.model(batch["src"], batch["tgt_input"])
+            # batch.get("image"): Multimodal이면 (B, C, H, W) 이미지 텐서,
+            # 텍스트-only면 None (모델이 이미지 경로를 건너뛴다).
+            logits = self.model(batch["src"], batch.get("image"), batch["tgt_input"])
             loss = self.criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
 
         # accumulation_steps로 나눠서, micro-batch gradient들의 합이 하나의

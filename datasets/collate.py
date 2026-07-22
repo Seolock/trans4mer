@@ -14,10 +14,14 @@
 
  입력 / 출력:
     입력 : Dataset에서 온 {"src": list[int], "tgt": list[int]}의 리스트.
+           Multimodal 데이터셋이면 각 아이템에 "image": (C, H, W) 텐서가
+           추가로 들어있다.
     출력 : {
         "src"       : (batch, max_src_len)      int64, 오른쪽 패딩
         "tgt_input" : (batch, max_tgt_len - 1)  int64, 오른쪽 패딩
         "tgt_output": (batch, max_tgt_len - 1)  int64, 오른쪽 패딩
+        "image"     : (batch, C, H, W)          float — 아이템에 이미지가
+                      있을 때만 포함 (텍스트-only면 이 키가 없다).
     }
 
  구현 세부사항:
@@ -26,6 +30,9 @@
       적어도 하나의 실제 key가 존재하는 것이 보장된다 (models/utils.py의
       마스크 설명 참고).
     - `tgt_output`의 패딩은 ignore_index를 통해 손실 계산에서 무시된다.
+    - 이미지는 데이터셋에서 이미 고정 크기로 리사이즈되므로 패딩 없이
+      단순 stack한다. 이미지 키는 아이템에 존재할 때만 배치에 넣어,
+      텍스트-only/레거시 경로의 배치 형식은 그대로 유지된다.
     - num_workers > 0에서도 피클 가능하도록 (단순 함수가 아니라) 클래스로
       구현했으며, 패딩 id를 한 번만 바인딩한다.
 ===============================================================================
@@ -66,7 +73,7 @@ class Seq2SeqCollator:
         """
         src = self._pad_batch([ex["src"] for ex in examples])
         tgt = self._pad_batch([ex["tgt"] for ex in examples])
-        return {
+        batch = {
             "src": src,
             # 패딩 *이후에* shift한다: 마지막 컬럼을 버리면 패딩이나 마지막
             # EOS 둘 중 하나가 제거되는데, 이는 정확히 입력에서 없어져야
@@ -74,3 +81,9 @@ class Seq2SeqCollator:
             "tgt_input": tgt[:, :-1].contiguous(),
             "tgt_output": tgt[:, 1:].contiguous(),
         }
+        # Multimodal: 이미지가 있는 데이터셋이면 고정 크기 이미지를 stack한다.
+        # (C, H, W) 텐서들 -> (batch, C, H, W). 이미지 키가 없으면 위 딕셔너리를
+        # 그대로 반환하므로 텍스트-only 배치 형식은 변하지 않는다.
+        if examples and "image" in examples[0]:
+            batch["image"] = torch.stack([ex["image"] for ex in examples], dim=0)
+        return batch

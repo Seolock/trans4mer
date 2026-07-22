@@ -11,13 +11,15 @@
     cross-attention을 통해 인코더 memory로부터 소스 정보를 끌어온다.
 
  입력 / 출력:
-    x          : (batch, tgt_len, d_model)  임베딩된 타겟 토큰
-    memory     : (batch, src_len, d_model)  인코더 출력
-    tgt_mask   : (batch, n_heads, tgt_len, tgt_len)에 브로드캐스트 가능한
-                 불리언
-    memory_mask: (batch, n_heads, tgt_len, src_len)에 브로드캐스트 가능한
-                 불리언
-    출력       : (batch, tgt_len, d_model)
+    x           : (batch, tgt_len, d_model)  임베딩된 타겟 토큰
+    memory      : (batch, src_len, d_model)  텍스트 인코더 출력
+    tgt_mask    : (batch, n_heads, tgt_len, tgt_len)에 브로드캐스트 가능한
+                  불리언
+    memory_mask : (batch, n_heads, tgt_len, src_len)에 브로드캐스트 가능한
+                  불리언
+    image_memory: (batch, num_patches, d_model) 이미지 인코더 출력 또는 None
+    image_mask  : 이미지 cross-attention용 선택적 마스크 또는 None
+    출력        : (batch, tgt_len, d_model)
 
  구현 세부사항:
     models/encoder.py와 동일한 구조를 따른다: 독립적인 레이어들을
@@ -62,24 +64,28 @@ class Decoder(nn.Module):
         memory: Tensor,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
+        image_memory: Optional[Tensor] = None,
+        image_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """임베딩된 타겟 prefix 배치를 미리 계산된 인코더 memory에 대해 디코딩한다.
 
         Args:
             x: ``(batch, tgt_len, d_model)`` 임베딩된 타겟 토큰.
-            memory: ``(batch, src_len, d_model)`` 인코더 출력.
+            memory: ``(batch, src_len, d_model)`` 텍스트 인코더 출력.
             tgt_mask: causal + 타겟-패딩이 결합된 마스크.
-            memory_mask: cross-attention을 위한 소스-패딩 마스크.
+            memory_mask: 텍스트 cross-attention을 위한 소스-패딩 마스크.
+            image_memory: ``(batch, num_patches, d_model)`` 이미지 인코더 출력 또는 None.
+            image_mask: 이미지 cross-attention용 선택적 마스크 또는 None.
 
         Returns:
             ``(batch, tgt_len, d_model)`` 디코더 상태 (프로젝션 전).
         """
         # ===================== 1) 디코더 레이어 스택 =====================
         # N개의 동일한 레이어를 순서대로 통과한다 (각 레이어 내부:
-        # 마스킹된 Self-Attention -> Cross-Attention -> Feed Forward,
-        # residual + LayerNorm 포함).
+        # 마스킹된 Self-Attention -> Text(+Image) Cross-Attention -> Fusion ->
+        # Feed Forward, residual + LayerNorm 포함).
         for layer in self.layers:
-            x = layer(x, memory, tgt_mask, memory_mask)
+            x = layer(x, memory, tgt_mask, memory_mask, image_memory, image_mask)
 
         # ===================== 2) 최종 LayerNorm (Pre-LN 전용) =====================
         if self.final_norm is not None:

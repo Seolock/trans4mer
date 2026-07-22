@@ -65,6 +65,7 @@ from inference.translator import Translator
 from preprocess import find_raw_file
 from trainer.evaluator import evaluate
 from utils.data_paths import default_checkpoint_path
+from utils.image import resolve_image_path
 from utils.logger import get_logger
 from utils.misc import get_device
 from utils.seed import set_seed
@@ -155,12 +156,25 @@ def evaluate_split(
         # 참조도 가설과 동일한 전처리(토큰화 + 소문자화)를 거친다.
         references = [" ".join(simple_tokenize(line, d.lowercase)) for line in fh]
 
+    # Multimodal: split별 이미지 리스트를 코퍼스와 인덱스 정렬해 로드한다.
+    image_paths: list[str] | None = None
+    if config.multimodal.use_image:
+        image_list = Path(config.multimodal.image_dir) / f"{split}.txt"
+        with open(image_list, "r", encoding="utf-8") as fh:
+            image_paths = [str(resolve_image_path(config.multimodal.image_dir, line)) for line in fh]
+        if len(image_paths) != len(sources):
+            raise ValueError(
+                f"Image/corpus mismatch for split '{split}': {len(image_paths)} images "
+                f"but {len(sources)} sentences."
+            )
+
     strategy = f"beam={config.inference.beam_size}" if config.inference.beam_size > 1 else "greedy"
     split_logger.info("Translating %d sentences (%s) ...", len(sources), strategy)
     hypotheses: list[str] = []
     for start in tqdm(range(0, len(sources), batch_size), desc=f"translate[{split}]"):
         batch = sources[start : start + batch_size]
-        hypotheses.extend(translator.translate_batch(batch))
+        batch_images = image_paths[start : start + batch_size] if image_paths is not None else None
+        hypotheses.extend(translator.translate_batch(batch, images=batch_images))
 
     # ------------------------------------------------ 3) sacreBLEU
     import sacrebleu

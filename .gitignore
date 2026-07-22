@@ -12,6 +12,7 @@ venv/
 # --- Generated data artifacts (reproducible via `python preprocess.py`) ---
 # 원본 코퍼스(data/raw/)는 추적하고, BPE/어휘집/id 산출물만 제외한다.
 data/data-bin/
+data/image/raw/
 
 # --- Training outputs (reproducible via `python train.py`) ---
 checkpoints/

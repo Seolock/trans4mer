@@ -308,6 +308,63 @@ class InferenceConfig:
     length_penalty: float = 0.6
 
 
+@dataclass
+class MultimodalConfig:
+    """Multimodal Machine Translation(MMT) — 이미지 인코더 / 융합 설정.
+
+    이 섹션이 텍스트-only Transformer를 이미지-보강 모델로 확장한다.
+    ``use_image`` 하나로 전체 이미지 경로가 켜지고 꺼진다: false면 이미지
+    관련 모듈(image encoder, image cross-attention, fusion)이 아예 생성되지
+    않으므로, 모델은 기존 텍스트 Transformer와 완전히 동일하게 동작하고
+    기존 체크포인트도 그대로 로드된다.
+
+    이미지 인코더는 pretrained/완성 Vision Backbone(torchvision.models, timm,
+    CLIP 등)을 쓰지 않고 Transformer와 동일하게 scratch로 구현한다 —
+    번역 손실만으로 end-to-end 학습된다. 최종 이미지 피처는 patch feature
+    전체(``(B, N, d_model)``, CLS 토큰만 쓰지 않음)를 사용한다.
+
+    Attributes:
+        use_image: 이미지 경로 마스터 스위치. false면 순수 텍스트 번역.
+        image_dir: ``raw/`` 이미지들과 split별 이미지 리스트(``{split}.txt``)를
+            담는 루트 디렉터리.
+        image_encoder: "vit"(패치 기반 Vision Transformer) 또는
+            "cnn"(ResNet 스타일). 둘 다 scratch 구현이며 교체 가능하다.
+        image_size: 정사각형으로 리사이즈할 입력 이미지 한 변의 크기.
+        patch_size: ViT 패치 한 변의 크기 (image_size를 나눠떨어뜨려야 함).
+            패치 개수 N = (image_size / patch_size)^2.
+        image_channels: 입력 이미지 채널 수 (RGB = 3).
+        image_embed_dim: 이미지 인코더 내부의 residual-stream 폭. 인코더
+            출력은 항상 model.d_model로 투영되므로 d_model과 달라도 된다.
+        image_layers: ViT 인코더 블록 수 (CNN은 residual 스테이지 수).
+        image_heads: ViT self-attention 헤드 수 (image_embed_dim을
+            나눠떨어뜨려야 함).
+        image_ffn_dim: ViT feed-forward 은닉 폭.
+        fusion_type: 두 cross-attention 출력을 합치는 방식.
+            "sum" | "weighted" | "gate".
+        fusion_lambda: "weighted" 융합의 고정 가중치 λ (text 쪽 비중);
+            출력 = λ*text + (1-λ)*image.
+        fusion_learnable_lambda: true면 "weighted"의 λ를 학습 가능한
+            파라미터로 둔다 (sigmoid로 (0,1) 유지). false면 fusion_lambda 고정.
+        freeze_image_encoder: true면 이미지 인코더 파라미터를 동결한다
+            (기본은 false — 번역 손실로 함께 학습).
+    """
+
+    use_image: bool = False
+    image_dir: str = "data/image"
+    image_encoder: str = "vit"
+    image_size: int = 224
+    patch_size: int = 16
+    image_channels: int = 3
+    image_embed_dim: int = 256
+    image_layers: int = 4
+    image_heads: int = 8
+    image_ffn_dim: int = 1024
+    fusion_type: str = "gate"
+    fusion_lambda: float = 0.5
+    fusion_learnable_lambda: bool = False
+    freeze_image_encoder: bool = False
+
+
 # ---------------------------------------------------------------------------
 # 최상위 설정
 # ---------------------------------------------------------------------------
@@ -320,6 +377,7 @@ _SECTION_TYPES: dict[str, type] = {
     "bpe": BPEConfig,
     "checkpoint": CheckpointConfig,
     "inference": InferenceConfig,
+    "multimodal": MultimodalConfig,
 }
 
 
@@ -342,6 +400,7 @@ class Config:
     bpe: BPEConfig = field(default_factory=BPEConfig)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
     inference: InferenceConfig = field(default_factory=InferenceConfig)
+    multimodal: MultimodalConfig = field(default_factory=MultimodalConfig)
 
     # ------------------------------------------------------------------ I/O
     @classmethod
@@ -453,3 +512,30 @@ class Config:
                 f"Active pair '{active}' (dataset.src_lang-tgt_lang) is not in "
                 f"dataset.lang_pairs {d.lang_pairs} — add it or fix src/tgt_lang."
             )
+        # 멀티모달(MMT) 제약 — use_image일 때만 검사한다 (텍스트-only는 영향 없음).
+        mm = self.multimodal
+        if mm.use_image:
+            if mm.image_encoder not in ("vit", "cnn"):
+                raise ValueError(
+                    f"multimodal.image_encoder must be 'vit' or 'cnn', got '{mm.image_encoder}'"
+                )
+            if mm.fusion_type not in ("sum", "weighted", "gate"):
+                raise ValueError(
+                    f"multimodal.fusion_type must be 'sum', 'weighted' or 'gate', "
+                    f"got '{mm.fusion_type}'"
+                )
+            if mm.image_encoder == "vit":
+                if mm.image_size % mm.patch_size != 0:
+                    raise ValueError(
+                        f"multimodal.image_size ({mm.image_size}) must be divisible by "
+                        f"patch_size ({mm.patch_size})"
+                    )
+                if mm.image_embed_dim % mm.image_heads != 0:
+                    raise ValueError(
+                        f"multimodal.image_embed_dim ({mm.image_embed_dim}) must be "
+                        f"divisible by image_heads ({mm.image_heads})"
+                    )
+            if not 0.0 <= mm.fusion_lambda <= 1.0:
+                raise ValueError(
+                    f"multimodal.fusion_lambda must be in [0, 1], got {mm.fusion_lambda}"
+                )

@@ -57,6 +57,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--sentence", required=True, help="source sentence to translate")
     parser.add_argument(
+        "--image", default=None,
+        help="image path for Multimodal (MMT) checkpoints; matched to the sentence",
+    )
+    parser.add_argument(
         "--set", nargs="+", action="extend", default=[], metavar="KEY=VALUE",
         help="config overrides (repeatable), e.g. --set inference.beam_size=1",
     )
@@ -98,7 +102,12 @@ def main() -> None:
     if args.set:
         translator.config.apply_overrides(args.set)
 
-    translation = translator.translate(args.sentence)
+    # Multimodal 체크포인트인데 이미지를 주지 않으면 이미지 없이(텍스트 경로로)
+    # 번역된다 — 사용자가 알 수 있도록 경고한다.
+    if translator.use_image and args.image is None:
+        logger.warning("Checkpoint is multimodal but no --image given; translating text-only.")
+
+    translation = translator.translate(args.sentence, image=args.image)
 
     tgt_lang = translator.config.dataset.tgt_lang
     language = LANGUAGE_NAMES.get(tgt_lang, tgt_lang)
