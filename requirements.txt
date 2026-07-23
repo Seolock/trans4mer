@@ -1,7 +1,6 @@
 # 핵심
-torch>=2.3          # trainer가 사용하는 torch.amp.GradScaler / autocast API
-torchvision>=0.20   # 이미지 로딩/전처리 (io.read_image, transforms) — MMT용. backbone(models)은 미사용
-numpy>=1.24
+torch>=2.3
+torchvision>=0.20
 
 # 설정 & CLI
 PyYAML>=6.0
@@ -10,9 +9,9 @@ PyYAML>=6.0
 tqdm>=4.66
 tensorboard>=2.15
 
-# 시각화 (어텐션 히트맵, 학습 곡선)
+# 시각화
 matplotlib>=3.8
 
-# 데이터 전처리 & 평가 (Multi30k 파이프라인)
-subword-nmt>=0.3.8   # BPE 학습/적용 (preprocess.py, inference/translator.py)
-sacrebleu>=2.4       # BLEU 평가 (test.py)
+# 데이터 전처리 & 평가
+subword-nmt>=0.3.8
+sacrebleu>=2.4

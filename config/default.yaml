@@ -124,4 +124,4 @@ multimodal:                      # Multimodal MT (이미지 보강). use_image=f
   fusion_learnable_lambda: false # true -> weighted의 λ를 학습 가능한 파라미터로
   freeze_image_encoder: false    # true -> 이미지 인코더 동결 (기본: 번역 손실로 함께 학습)
   use_image_cache: true         # true -> preprocess_images.py로 만든 uint8 캐시(memmap)에서 로드
-  image_cache_dir: data-bin/image  # 캐시 .npy 저장 위치 ({split}_{image_size}.npy)
+  image_cache_dir: data/data-bin/image  # 캐시 .npy 저장 위치 ({split}_{image_size}.npy)

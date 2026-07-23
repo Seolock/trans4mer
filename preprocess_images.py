@@ -165,7 +165,7 @@ def main() -> None:
             built += 1
 
     logger.info(
-        "Done — %d/%d split(s) cached. Enable with `--set multimodal.use_image_cache=true`.",
+        "Done — %d/%d split(s) cached.",
         built, len(args.splits),
     )
 
