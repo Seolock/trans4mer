@@ -102,8 +102,96 @@ class CheckpointManager:
         return path
 
     def save_epoch(self, state: dict[str, Any], epoch: int) -> Path:
-        """주기적인 epoch별 스냅샷을 기록한다 (영구 보존)."""
+        """주기적인 epoch별 스냅샷을 기록한다 (학습 종료 시 정리 대상)."""
         return self._write(state, f"epoch_{epoch:03d}.pt")
+
+    # ----------------------------------------------- 앙상블 & 정리
+    def _epoch_checkpoint_paths(self) -> list[Path]:
+        """모든 epoch_*.pt를 epoch 번호 오름차순으로 정렬해 반환한다.
+
+        Returns:
+            정렬된 Path 리스트 (파일이 없으면 빈 리스트). 파일명이
+            "epoch_{번호}.pt" 규칙을 따르지 않는 것은 건너뛴다.
+        """
+        paths = []
+        for path in self.save_dir.glob("epoch_*.pt"):
+            try:
+                epoch = int(path.stem.split("_")[1])
+            except (IndexError, ValueError):
+                continue  # 예상치 못한 이름은 무시
+            paths.append((epoch, path))
+        return [path for _, path in sorted(paths)]
+
+    def save_ensemble(self, last_n: int) -> Optional[Path]:
+        """최근 ``last_n``개 epoch 체크포인트를 가중치 평균해 ensemble.pt로 저장한다.
+
+        "Attention Is All You Need"의 checkpoint averaging 기법: 여러
+        체크포인트의 model 파라미터를 원소별로 평균한 단일 모델을 만든다.
+        추가 메모리/연산 없이 test.py / Translator가 일반 체크포인트처럼
+        그대로 로드할 수 있다.
+
+        Args:
+            last_n: 평균에 사용할 최근 epoch 체크포인트 개수 (실제 파일이
+                더 적으면 있는 만큼만 사용).
+
+        Returns:
+            저장된 ensemble.pt 경로, 또는 평균할 epoch 체크포인트가 하나도
+            없으면 None.
+        """
+        paths = self._epoch_checkpoint_paths()
+        if last_n > 0:
+            paths = paths[-last_n:]
+        if not paths:
+            logger.warning("No epoch checkpoints found to ensemble in %s", self.save_dir)
+            return None
+
+        # 첫 체크포인트로 누적 버퍼를 만들고(부동소수만 float로 승격),
+        # 나머지를 더한 뒤 개수로 나눈다. 부동소수가 아닌 텐서(정수 버퍼
+        # 등)는 평균이 의미 없으므로 마지막 체크포인트 값을 그대로 쓴다.
+        num_ckpts = len(paths)
+        averaged: dict[str, torch.Tensor] = {}
+        original_dtypes: dict[str, torch.dtype] = {}
+        for index, path in enumerate(paths):
+            model_state = self.load(path, map_location="cpu")["model"]
+            for key, tensor in model_state.items():
+                if index == 0:
+                    original_dtypes[key] = tensor.dtype
+                    averaged[key] = tensor.float() if tensor.is_floating_point() else tensor.clone()
+                elif tensor.is_floating_point():
+                    averaged[key] += tensor.float()
+                else:
+                    averaged[key] = tensor.clone()  # 최신 값 유지
+
+        for key, tensor in averaged.items():
+            if tensor.is_floating_point():
+                averaged[key] = (tensor / num_ckpts).to(original_dtypes[key])
+
+        # 설정/epoch 메타데이터는 가장 최근(마지막) 체크포인트에서 가져온다.
+        newest = self.load(paths[-1], map_location="cpu")
+        ensemble_epochs = [int(p.stem.split("_")[1]) for p in paths]
+        ensemble_state = {
+            "model": averaged,
+            "config": newest.get("config"),
+            "epoch": newest.get("epoch"),
+            "ensemble_epochs": ensemble_epochs,
+        }
+        path = self._write(ensemble_state, "ensemble.pt")
+        logger.info("Saved ensemble of %d checkpoints (epochs %s) -> %s",
+                    num_ckpts, ensemble_epochs, path)
+        return path
+
+    def cleanup_epoch_checkpoints(self) -> int:
+        """모든 epoch_*.pt를 삭제한다 (last/best/ensemble은 이름이 달라 보존).
+
+        Returns:
+            삭제한 파일 개수.
+        """
+        paths = self._epoch_checkpoint_paths()
+        for path in paths:
+            path.unlink()
+        if paths:
+            logger.info("Removed %d epoch checkpoint(s) from %s", len(paths), self.save_dir)
+        return len(paths)
 
     # --------------------------------------------------------------- 읽기
     @property

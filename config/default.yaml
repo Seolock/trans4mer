@@ -66,7 +66,7 @@ training:
   seed: 42
   mixed_precision: false         # AMP (CUDA에서만 효과 있음)
   accumulation_steps: 1          # 그래디언트 누적 micro-batch 수
-  num_workers: 2
+  num_workers: 8
   save_every: 1                  # N epoch마다 주기적으로 체크포인트 저장
   validate_every: 1              # N epoch마다 검증
   log_every: 50                  # N 옵티마이저 스텝마다 TensorBoard 로깅
@@ -80,9 +80,8 @@ dataset:
   src_lang: en                   # 활성 쌍의 소스 언어 (train/test/translate가 사용)
   tgt_lang: de                   # 활성 쌍의 타겟 언어 (fr로 바꾸면 en-fr task)
   valid_split: val               # 학습 중 검증에 사용할 split
-  test_split: test2016           # test.py 평가 split (test2016|test2017|testcoco|test2018)
+  test_split: test2016           # train.py 학습 후 teacher-forced 사후 확인용 split
   lowercase: true                # preprocess.py / translate.py가 동일하게 적용
-  min_freq: 1                    # (레거시 토이 파이프라인용)
 
 bpe:
   num_merges: 10000              # BPE merge operation 횟수 (en+de 공동 학습)
@@ -94,6 +93,9 @@ checkpoint:
   save_dir: checkpoints
   resume_checkpoint: null        # 재개할 체크포인트 경로
   best_metric: loss              # loss | perplexity | token_accuracy | accuracy
+  save_ensemble: true            # 학습 종료 시 최근 N개 체크포인트를 가중치 평균해 ensemble.pt 저장
+  ensemble_last_n: 10            # 앙상블 평균에 사용할 최근 epoch 체크포인트 개수
+  cleanup_epoch_checkpoints: true  # 종료 시 epoch_*.pt 전부 삭제 (last/best/ensemble은 보존)
 
 inference:
   beam_size: 4
@@ -104,20 +106,22 @@ inference:
   top_k: 0                       # 0이면 top-k 필터링 비활성화
   top_p: 1.0                     # 1.0이면 nucleus 필터링 비활성화
   repetition_penalty: 1.0
-  length_penalty: 0.6            # GNMT 길이 정규화 지수
+  length_penalty: 1.0            # GNMT 길이 정규화 지수
 
 multimodal:                      # Multimodal MT (이미지 보강). use_image=false면 텍스트-only와 동일
   use_image: true                # 이미지 경로 마스터 스위치 (false -> 기존 텍스트 Transformer)
   image_dir: data/image          # raw/ 이미지들과 split별 {split}.txt 리스트를 담는 루트
   image_encoder: vit             # vit | cnn (둘 다 scratch 구현, 교체 가능)
-  image_size: 224                # 정사각 리사이즈 크기
-  patch_size: 16                 # ViT patch 크기 (224/16 -> 196 patch tokens)
+  image_size: 384                # 정사각 리사이즈 크기
+  patch_size: 32                 # ViT patch 크기 (384/32 -> 144 patch tokens)
   image_channels: 3              # 입력 채널 (RGB)
-  image_embed_dim: 256           # 이미지 인코더 내부 폭 (최종 d_model로 투영)
+  image_embed_dim: 128           # 이미지 인코더 내부 폭 (최종 d_model로 투영)
   image_layers: 4                # ViT 블록 수 (CNN은 residual 스테이지 수)
-  image_heads: 8                 # ViT self-attention 헤드 (image_embed_dim 나눠떨어짐)
-  image_ffn_dim: 1024            # ViT feed-forward 은닉 폭
+  image_heads: 4                 # ViT self-attention 헤드 (image_embed_dim 나눠떨어짐)
+  image_ffn_dim: 256             # ViT feed-forward 은닉 폭
   fusion_type: gate              # sum | weighted | gate
   fusion_lambda: 0.5             # weighted 융합의 고정 λ (text 비중)
   fusion_learnable_lambda: false # true -> weighted의 λ를 학습 가능한 파라미터로
   freeze_image_encoder: false    # true -> 이미지 인코더 동결 (기본: 번역 손실로 함께 학습)
+  use_image_cache: true         # true -> preprocess_images.py로 만든 uint8 캐시(memmap)에서 로드
+  image_cache_dir: data-bin/image  # 캐시 .npy 저장 위치 ({split}_{image_size}.npy)

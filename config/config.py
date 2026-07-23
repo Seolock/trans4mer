@@ -218,8 +218,11 @@ class DatasetConfig:
         tgt_lang: 활성 쌍의 타겟 언어 코드.
             (f"{src_lang}-{tgt_lang}"가 lang_pairs에 포함되어야 함.)
         valid_split: 학습 중 검증에 사용할 split 이름.
-        test_split: test.py 평가에 사용할 split 이름
-            (test2016 | test2017 | testcoco | test2018).
+        test_split: train.py가 학습 종료 직후 best 체크포인트로 수행하는
+            teacher-forced 사후 확인(loss/perplexity/accuracy)에 쓸 split
+            이름 (test2016 | test2017 | testcoco | test2018). test.py는
+            이 값을 쓰지 않고 --test-splits로 평가할 split을 별도 지정한다
+            (기본값: test2016/test2017/testcoco/test2018 네 개 전부).
         lowercase: 토큰화 전 텍스트를 소문자로 변환할지 여부
             (preprocess.py와 translate.py가 반드시 같은 값을 써야 함).
         min_freq: 어휘집에 포함되기 위한 최소 토큰 등장 빈도 (레거시
@@ -272,11 +275,20 @@ class CheckpointConfig:
             비활성화).
         best_metric: "최고" 모델을 정의하는 검증 지표
             ("loss", "perplexity", "token_accuracy" 또는 "accuracy").
+        save_ensemble: 학습 종료 시 최근 epoch 체크포인트들을 가중치
+            평균(checkpoint averaging)하여 단일 ensemble.pt로 저장할지 여부.
+        ensemble_last_n: 앙상블 평균에 사용할 최근 epoch 체크포인트 개수.
+        cleanup_epoch_checkpoints: 학습 종료 시(앙상블 저장 후) 모든
+            epoch_*.pt를 삭제할지 여부. last.pt / best.pt / ensemble.pt는
+            이름이 달라 보존된다.
     """
 
     save_dir: str = "checkpoints"
     resume_checkpoint: Optional[str] = None
     best_metric: str = "loss"
+    save_ensemble: bool = True
+    ensemble_last_n: int = 10
+    cleanup_epoch_checkpoints: bool = True
 
 
 @dataclass
@@ -347,6 +359,12 @@ class MultimodalConfig:
             파라미터로 둔다 (sigmoid로 (0,1) 유지). false면 fusion_lambda 고정.
         freeze_image_encoder: true면 이미지 인코더 파라미터를 동결한다
             (기본은 false — 번역 손실로 함께 학습).
+        use_image_cache: true면 매 스텝 JPEG를 디코딩/리사이즈하지 않고,
+            preprocess_images.py가 미리 만들어둔 uint8 캐시(memmap)에서
+            읽는다 (학습 데이터 로딩 병목 완화). 캐시 파일이 없거나
+            image_size가 다르면 명확한 에러를 낸다.
+        image_cache_dir: 캐시 .npy 파일들이 저장되는 디렉터리
+            (파일명은 {split}_{image_size}.npy).
     """
 
     use_image: bool = False
@@ -363,6 +381,8 @@ class MultimodalConfig:
     fusion_lambda: float = 0.5
     fusion_learnable_lambda: bool = False
     freeze_image_encoder: bool = False
+    use_image_cache: bool = False
+    image_cache_dir: str = "data/image/cache"
 
 
 # ---------------------------------------------------------------------------

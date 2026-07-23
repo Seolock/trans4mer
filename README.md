@@ -20,16 +20,19 @@ pip install -r requirements.txt
 ## 사용법
 
 ```bash
-# 1. 텍스트 전처리:
+# 1. 텍스트 전처리
 python preprocess.py
 
-# 2. 훈련
+# 2. 이미지 전처리
+python preprocess_images.py
+
+# 3. 훈련
 python train.py
 
-# 3. 테스트
+# 4. 테스트
 python test.py
 
-# 4. 문장 번역
+# 5. 문장 번역
 python translate.py --sentence "your sentence .."
 
 python translate.py --sentence "your sentence .." --image path/to/image
@@ -41,3 +44,5 @@ python translate.py --sentence "your sentence .." --image path/to/image
 모든 하이퍼파라미터는
 `config/default.yaml`에
 있으며 실행시 `--set parameter=value`로 무엇이든 오버라이드할 수 있습니다.
+
+

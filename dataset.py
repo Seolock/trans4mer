@@ -7,8 +7,9 @@
  역할:
     - `TranslationDataset`: preprocess.py가 만든 토큰 id 파일
       ({split}.ids.{src}, {split}.ids.{tgt})을 줄 단위로 짝지어 로드하고,
-      타겟에 <s>/</s>를 붙인다. Multimodal(use_image)이면 split별 이미지
-      리스트({split}.txt)를 함께 읽어 각 문장에 대응되는 이미지를 로드한다.
+      타겟에 <s>/</s>를 붙인다. Multimodal(use_image)이면 각 문장에 대응되는
+      이미지를 함께 로드한다 — JPEG 즉석 로드(split별 {split}.txt) 또는
+      preprocess_images.py가 만든 uint8 캐시(memmap, use_image_cache) 중 하나.
     - `collate_fn`: 배치 패딩 + teacher-forcing shift. 기존
       datasets/collate.py 의 Seq2SeqCollator 를 그대로 재사용한다
       (동일한 배치 형식을 만들기 때문) — 패딩과 shift 규칙은 그 파일에
@@ -48,13 +49,19 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
 from config.config import Config
 from datasets.collate import Seq2SeqCollator
 from utils.data_paths import ids_path, pair_dir
-from utils.image import build_image_transform, load_image_tensor, resolve_image_path
+from utils.image import (
+    build_image_transform,
+    build_normalize_transform,
+    load_image_tensor,
+    resolve_image_path,
+)
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -119,9 +126,13 @@ class TranslationDataset(Dataset):
         eos_id: 타겟 문장 종료(</s>) id.
         max_seq_length: 시퀀스 길이 상한 (model.max_seq_length).
         image_list_path: split별 이미지 리스트 경로 (예: data/image/train.txt).
-            None이면 텍스트-only.
-        image_dir: 이미지 루트 (raw/ 하위에 실제 파일). image_list_path와 함께 필요.
-        image_size: 정사각 리사이즈 크기 (multimodal.image_size).
+            JPEG 즉석 로드 경로에서 사용. None이면 텍스트-only 또는 캐시 모드.
+        image_dir: 이미지 루트 (raw/ 하위에 실제 파일). JPEG 모드에서 필요.
+        image_size: 정사각 리사이즈 크기 (multimodal.image_size). 캐시 모드에서
+            헤더 검증에 사용.
+        image_cache_path: preprocess_images.py가 만든 uint8 캐시 .npy 경로.
+            주어지면 JPEG 디코딩 대신 memmap에서 읽는다 (image_list_path와
+            둘 중 하나만 주면 됨).
     """
 
     def __init__(
@@ -134,6 +145,7 @@ class TranslationDataset(Dataset):
         image_list_path: Optional[str | Path] = None,
         image_dir: Optional[str | Path] = None,
         image_size: Optional[int] = None,
+        image_cache_path: Optional[str | Path] = None,
     ) -> None:
         src_lines = _read_ids_file(src_ids_path)
         tgt_lines = _read_ids_file(tgt_ids_path)
@@ -144,8 +156,35 @@ class TranslationDataset(Dataset):
             )
 
         # ------------------------------------------------------ 이미지 설정
-        self.use_image = image_list_path is not None
-        if self.use_image:
+        # 두 경로: (A) JPEG 즉석 로드(image_list_path), (B) uint8 캐시(image_cache_path).
+        self.use_image = image_list_path is not None or image_cache_path is not None
+        self.use_cache = image_cache_path is not None
+        image_names: list[str] = []
+        if self.use_cache:
+            # 캐시 헤더만 읽어 정렬/해상도를 검증한다 (데이터는 로드하지 않음).
+            self.image_cache_path = Path(image_cache_path)
+            try:
+                header = np.load(self.image_cache_path, mmap_mode="r")
+            except FileNotFoundError as error:
+                raise FileNotFoundError(
+                    f"Image cache not found: {self.image_cache_path} — run "
+                    f"`python preprocess_images.py` (or set multimodal.use_image_cache=false)."
+                ) from error
+            if header.shape[0] != len(src_lines):
+                raise ValueError(
+                    f"Image cache/corpus mismatch: {self.image_cache_path} has "
+                    f"{header.shape[0]} rows but corpus has {len(src_lines)} — rebuild the cache."
+                )
+            if header.shape[2] != image_size or header.shape[3] != image_size:
+                raise ValueError(
+                    f"Image cache size mismatch: {self.image_cache_path} is "
+                    f"{header.shape[2]}x{header.shape[3]} but multimodal.image_size={image_size} "
+                    f"— rebuild with `python preprocess_images.py`."
+                )
+            del header  # 검증용 memmap을 닫는다 (실제 로드는 워커별로 지연 오픈).
+            self._image_cache: Optional[np.memmap] = None  # 워커마다 개별 지연 오픈
+            self.normalize_transform = build_normalize_transform()
+        elif self.use_image:
             image_names = _read_image_list(image_list_path)
             if len(image_names) != len(src_lines):
                 raise ValueError(
@@ -169,8 +208,10 @@ class TranslationDataset(Dataset):
             if len(tgt) > max_seq_length:
                 tgt = tgt[: max_seq_length - 1] + [eos_id]
             example: dict[str, object] = {"src": src, "tgt": tgt}
-            if self.use_image:
-                # 원본 줄 인덱스로 이미지를 짝짓는다 (skip된 줄은 이미지도 제외됨).
+            # 원본 줄 인덱스로 이미지를 짝짓는다 (skip된 줄은 이미지도 제외됨).
+            if self.use_cache:
+                example["image_row"] = line_index  # 캐시 memmap의 row 인덱스
+            elif self.use_image:
                 example["image_path"] = resolve_image_path(self.image_dir, image_names[line_index])
             self.examples.append(example)
 
@@ -187,8 +228,16 @@ class TranslationDataset(Dataset):
         example = self.examples[index]
         if not self.use_image:
             return example
-        # 이미지를 지연 로드한다 (전체를 메모리에 올리지 않음): (C, H, W) 텐서.
-        image = load_image_tensor(example["image_path"], transform=self.image_transform)
+        if self.use_cache:
+            # memmap을 워커 프로세스마다 지연 오픈한다 (OS 페이지 캐시는 공유됨).
+            if self._image_cache is None:
+                self._image_cache = np.load(self.image_cache_path, mmap_mode="r")
+            # 해당 row(uint8 (C,S,S))만 mmap에서 복사해 오고 로드 시점에 정규화한다.
+            row = np.asarray(self._image_cache[example["image_row"]])
+            image = self.normalize_transform(torch.from_numpy(row.copy()))
+        else:
+            # 이미지를 지연 로드한다 (전체를 메모리에 올리지 않음): (C, H, W) 텐서.
+            image = load_image_tensor(example["image_path"], transform=self.image_transform)
         return {"src": example["src"], "tgt": example["tgt"], "image": image}
 
 
@@ -226,8 +275,16 @@ def build_split_dataloader(
     """
     d, t, mm = config.dataset, config.training, config.multimodal
     base_dir = pair_dir(d.bin_dir, d.src_lang, d.tgt_lang)
-    # Multimodal이면 split 이름과 동일한 이미지 리스트({split}.txt)를 함께 준다.
-    image_list_path = Path(mm.image_dir) / f"{split}.txt" if mm.use_image else None
+    # Multimodal 이미지 소스 선택:
+    #   use_image_cache -> preprocess_images.py가 만든 uint8 캐시(memmap)에서 로드,
+    #   그 외 use_image  -> split 이름과 동일한 이미지 리스트({split}.txt)로 JPEG 즉석 로드.
+    image_list_path = None
+    image_cache_path = None
+    if mm.use_image:
+        if mm.use_image_cache:
+            image_cache_path = Path(mm.image_cache_dir) / f"{split}_{mm.image_size}.npy"
+        else:
+            image_list_path = Path(mm.image_dir) / f"{split}.txt"
     dataset = TranslationDataset(
         src_ids_path=ids_path(base_dir, split, d.src_lang),
         tgt_ids_path=ids_path(base_dir, split, d.tgt_lang),
@@ -237,6 +294,7 @@ def build_split_dataloader(
         image_list_path=image_list_path,
         image_dir=mm.image_dir if mm.use_image else None,
         image_size=mm.image_size if mm.use_image else None,
+        image_cache_path=image_cache_path,
     )
     loader = DataLoader(
         dataset,
@@ -246,6 +304,8 @@ def build_split_dataloader(
         collate_fn=collate_fn(pad_id),
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
+        # 워커를 epoch 간 유지해 재시작 비용과 (캐시 모드의) memmap 재오픈을 줄인다.
+        persistent_workers=t.num_workers > 0,
     )
     logger.info("%s (%s-%s): %d pairs", split, d.src_lang, d.tgt_lang, len(dataset))
     return loader

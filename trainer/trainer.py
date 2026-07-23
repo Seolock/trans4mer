@@ -190,6 +190,15 @@ class Trainer:
                 )
                 break
 
+        # 학습 종료 마무리: 먼저 최근 epoch 체크포인트로 앙상블을 만들고
+        # (이 시점엔 epoch_*.pt가 아직 존재), 그다음 epoch 파일을 정리한다.
+        # 순서가 뒤바뀌면 앙상블 재료가 사라지므로 반드시 앙상블 -> 정리.
+        c = self.config.checkpoint
+        if c.save_ensemble:
+            self.checkpoints.save_ensemble(c.ensemble_last_n)
+        if c.cleanup_epoch_checkpoints:
+            self.checkpoints.cleanup_epoch_checkpoints()
+
         self.writer.close()
         if best_metrics:
             self.logger.info("Best validation metrics: %s", _format_metrics(best_metrics))
