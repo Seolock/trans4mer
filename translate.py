@@ -7,7 +7,7 @@
  역할:
     사용 예:
         python translate.py \\
-            --checkpoint checkpoints/best.pt \\
+            --checkpoint checkpoints/en-de/ensemble.pt \\
             --sentence "A man is riding a bicycle."
 
     출력:
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="config/default.yaml", help="YAML config path")
     parser.add_argument(
         "--checkpoint", default=None,
-        help="checkpoint path (default: {save_dir}/{src}-{tgt}/best.pt from the config)",
+        help="checkpoint path (default: {save_dir}/{src}-{tgt}/ensemble.pt from the config)",
     )
     parser.add_argument("--sentence", required=True, help="source sentence to translate")
     parser.add_argument(
@@ -77,8 +77,8 @@ def main() -> None:
     from utils.data_paths import default_checkpoint_path
 
     # 체크포인트를 지정하지 않으면 설정의 활성 쌍(src_lang-tgt_lang)으로
-    # 기본 경로를 해석한다. --set 오버라이드도 경로 결정에 반영된다
-    # (예: --set dataset.tgt_lang=fr -> checkpoints/en-fr/best.pt).
+    # 기본 경로(ensemble.pt)를 해석한다. --set 오버라이드도 경로 결정에
+    # 반영된다 (예: --set dataset.tgt_lang=fr -> checkpoints/en-fr/ensemble.pt).
     checkpoint_path = args.checkpoint
     if checkpoint_path is None:
         cli_config = Config.from_yaml(args.config, overrides=args.set)

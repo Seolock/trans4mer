@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default="config/default.yaml", help="YAML config path")
     parser.add_argument(
         "--checkpoint", default=None,
-        help="checkpoint path (default: {save_dir}/{src}-{tgt}/best.pt from the config)",
+        help="checkpoint path (default: {save_dir}/{src}-{tgt}/ensemble.pt from the config)",
     )
     parser.add_argument(
         "--set", nargs="+", action="extend", default=[], metavar="KEY=VALUE",
@@ -216,6 +216,7 @@ def main() -> None:
 
     # 체크포인트 경로를 먼저 정해야 그 옆에 로그/결과를 쓸 디렉터리를 안다
     # (train.py가 train.log를 checkpoint.save_dir에 남기는 것과 동일한 규칙).
+    # --checkpoint 미지정 시 기본값은 ensemble.pt (default_checkpoint_path 참고).
     checkpoint_path = args.checkpoint or str(
         default_checkpoint_path(
             cli_config.checkpoint.save_dir,

@@ -16,7 +16,7 @@
  입력 / 출력:
     predict(text: str) -> str   (문장 하나 입력, 문장 하나 출력)
     predict_batch(list[str]) -> list[str]
-    CLI: python -m inference.predict --checkpoint checkpoints/best.pt \
+    CLI: python -m inference.predict --checkpoint checkpoints/ensemble.pt \
              --tokenizer data/tokenizer.json --text "..."
 
  구현 세부사항:
@@ -257,7 +257,7 @@ class Predictor:
 def main() -> None:
     """커맨드라인 진입점: 학습된 체크포인트로 --text를 디코딩한다."""
     parser = argparse.ArgumentParser(description="Decode text with a trained Transformer")
-    parser.add_argument("--checkpoint", default="checkpoints/best.pt", help="checkpoint path")
+    parser.add_argument("--checkpoint", default="checkpoints/ensemble.pt", help="checkpoint path")
     parser.add_argument("--tokenizer", default="data/tokenizer.json", help="tokenizer JSON path")
     parser.add_argument("--text", required=True, help="input sentence to decode")
     parser.add_argument(

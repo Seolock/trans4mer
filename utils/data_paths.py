@@ -61,14 +61,18 @@ def vocab_path(pair_directory: str | Path, lang: str) -> Path:
     return Path(pair_directory) / f"vocab.{lang}"
 
 
-def default_checkpoint_path(save_dir: str | Path, src_lang: str, tgt_lang: str) -> Path:
-    """활성 쌍의 기본 best 체크포인트 경로를 해석한다.
+def default_checkpoint_path(
+    save_dir: str | Path, src_lang: str, tgt_lang: str, filename: str = "ensemble.pt"
+) -> Path:
+    """활성 쌍의 기본 체크포인트 경로를 해석한다.
 
     train.py의 저장 규칙과 동일: save_dir가 이미 쌍 이름으로 끝나지
-    않으면 쌍 하위 디렉터리를 붙인다 -> {save_dir}/{src}-{tgt}/best.pt.
-    test.py와 translate.py가 --checkpoint 미지정 시 사용한다.
+    않으면 쌍 하위 디렉터리를 붙인다 -> {save_dir}/{src}-{tgt}/{filename}.
+    test.py와 translate.py가 --checkpoint 미지정 시 사용한다. 기본값은
+    ensemble.pt(최근 여러 epoch 가중치 평균 — 단일 체크포인트보다 일반적으로
+    더 안정적)이며, filename="best.pt"로 넘기면 단일 best 체크포인트를 쓸 수 있다.
     """
     save_dir = Path(save_dir)
     if save_dir.name != pair_name(src_lang, tgt_lang):
         save_dir = save_dir / pair_name(src_lang, tgt_lang)
-    return save_dir / "best.pt"
+    return save_dir / filename
