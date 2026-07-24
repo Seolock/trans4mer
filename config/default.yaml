@@ -69,7 +69,7 @@ training:
   num_workers: 4
   save_every: 1                  # N epoch마다 주기적으로 체크포인트 저장
   validate_every: 1              # N epoch마다 검증
-  log_every: 50                  # N 옵티마이저 스텝마다 TensorBoard 로깅
+  log_every: 50                  # N 옵티마이저 스텝마다 train.log에 로깅
   early_stopping_patience: 10     # 개선 없이 허용하는 검증 횟수 (0이면 비활성화)
   device: null                   # cuda | cuda:N | mps | cpu | null(자동 감지)
   valid_bleu: true               # 매 검증마다 greedy 생성으로 valid BLEU 로깅 (비싸면 false)

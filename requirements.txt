@@ -7,15 +7,22 @@ PyYAML>=6.0
 
 # 학습 UX
 tqdm>=4.66
-tensorboard>=2.15
 
 # 시각화
 matplotlib>=3.8
 
 # 데이터 전처리 & 평가
 subword-nmt>=0.3.8
-sacrebleu>=2.4
-nltk>=3.8
+sacrebleu>=2.4          # BLEU
+nltk>=3.8               # METEOR (WordNet/OMW 데이터는 최초 실행 시 자동 다운로드)
+
+# COMET (unbabel-comet). numpy<2 / protobuf<5 / torchmetrics 0.10.x /
+# pytorch-lightning 2.x를 함께 끌어온다 (모두 comet이 선언한 핀).
+#   setuptools<81 : comet이 쓰는 torchmetrics 0.10.x가 Python 3.13에서 제거된
+#                   pkg_resources를 import하므로, 그것을 제공하는 구버전
+#                   setuptools가 필요하다.
+# COMET 모델(기본 Unbabel/wmt22-comet-da)은 최초 실행 시 ~2.3GB를 내려받으며,
+# 미설치/실패여도 test.py는 BLEU+METEOR로 정상 동작한다(graceful). 건너뛰려면
+# `python test.py --no-comet`.
 unbabel-comet>=2.2
-torchmetrics>=1.0
-protobuf>=6.31.1
+setuptools<81

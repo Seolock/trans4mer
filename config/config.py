@@ -183,13 +183,13 @@ class TrainingConfig:
         num_workers: DataLoader 워커 프로세스 수.
         save_every: N epoch마다 주기적으로 체크포인트 저장.
         validate_every: N epoch마다 검증(validation) 실행.
-        log_every: N 옵티마이저 스텝마다 TensorBoard에 학습 스칼라 로깅.
+        log_every: N 옵티마이저 스텝마다 train.log에 학습 스칼라 로깅.
         early_stopping_patience: best metric 개선 없이 N번 검증 후 학습
             중단 (0이면 early stopping 비활성화).
         device: 사용할 디바이스 ("cuda" | "cuda:N" | "mps" | "cpu").
             null이면 자동 감지 (CUDA -> MPS -> CPU 순).
         valid_bleu: 매 검증마다 greedy 생성으로 valid BLEU를 계산해
-            train.log / TensorBoard에 로깅할지 여부. 생성은 teacher-forced
+            train.log에 로깅할지 여부. 생성은 teacher-forced
             평가보다 비싸므로, 부담되면 false로 끄거나 validate_every로
             빈도를 조절한다 (fairseq --eval-bleu에 해당).
     """
@@ -275,7 +275,7 @@ class CheckpointConfig:
     """체크포인트 저장 동작 방식.
 
     Attributes:
-        save_dir: 모든 체크포인트와 TensorBoard 로그를 담을 디렉터리.
+        save_dir: 모든 체크포인트와 로그를 담을 디렉터리.
         resume_checkpoint: 학습을 이어갈 체크포인트 경로 ("" / null이면
             비활성화).
         best_metric: "최고" 모델을 정의하는 검증 지표

@@ -15,7 +15,7 @@
  입력 / 출력:
     입력 : YAML 설정 (+ --set 오버라이드, --resume 체크포인트).
     출력 : checkpoint.save_dir 아래에 last/best/epoch 체크포인트,
-           TensorBoard 로그, train.log, 확정된 config.yaml.
+           train.log, 확정된 config.yaml.
 
  구현 세부사항:
     - 어휘집이 현실을 정의한다: 모델을 만들기 *전에* vocab.en / vocab.de
@@ -28,9 +28,9 @@
       구현되어 있다.
     - best 체크포인트는 validation loss 기준으로 저장된다
       (checkpoint.best_metric으로 변경 가능).
-    - 학습 중 valid BLEU는 매 검증마다 greedy 생성으로 계산되어 train.log와
-      TensorBoard에 기록된다 (training.valid_bleu). 최종 test BLEU는 여전히
-      test.py가 빔서치로 계산한다.
+    - 학습 중 valid BLEU는 매 검증마다 greedy 생성으로 계산되어 train.log에
+      기록된다 (training.valid_bleu). 최종 test BLEU는 여전히 test.py가
+      빔서치로 계산한다.
 ===============================================================================
 """
 

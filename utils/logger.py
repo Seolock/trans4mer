@@ -7,7 +7,6 @@
 
  역할:
     print() 대신 어디서나 사용하는 단일 진입점 `get_logger(name)`.
-    TensorBoard 스칼라 로깅은 별개이며 Trainer에 있다.
 
  입력 / 출력:
     입력 : 로거 이름(보통 __name__)과 선택적 로그 파일 경로.

@@ -4,7 +4,7 @@
  목적:
     전체 학습 루프: epoch, gradient 누적, 혼합 정밀도, gradient 클리핑,
     LR 스케줄링, 검증, early stopping, 체크포인팅(last / best / periodic),
-    재개, TensorBoard 로깅.
+    재개, train.log 로깅.
 
  역할:
     모든 학습 관련 컴포넌트를 조율하지만 과학적 내용은 소유하지 않는다:
@@ -14,7 +14,7 @@
 
  입력 / 출력:
     입력 : Config, Transformer, train/valid DataLoader, device.
-    출력 : `checkpoint.save_dir` 아래에 체크포인트 + TensorBoard 로그;
+    출력 : `checkpoint.save_dir` 아래에 체크포인트 + train.log;
            `fit()`은 관찰된 최고 검증 지표를 반환한다.
 
  구현 세부사항:
@@ -43,7 +43,6 @@ from typing import Any, Optional
 import torch
 from torch import amp, nn
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from config.config import Config, OptimizationConfig
@@ -144,8 +143,7 @@ class Trainer:
             self.logger.warning("mixed_precision requested but no CUDA device — running FP32")
         self.scaler = amp.GradScaler("cuda", enabled=self.amp_enabled)
 
-        # -------------------------------------------- 로깅 & 체크포인트
-        self.writer = SummaryWriter(log_dir=str(Path(c.save_dir) / "tensorboard"))
+        # -------------------------------------------------------- 체크포인트
         self.checkpoints = CheckpointManager(c.save_dir, metric_name=c.best_metric)
 
         # ------------------------------------------------------ 루프 상태
@@ -175,8 +173,7 @@ class Trainer:
         )
 
         for epoch in range(self.start_epoch, t.epochs):
-            train_loss = self._train_epoch(epoch)
-            self.writer.add_scalar("train/epoch_loss", train_loss, epoch + 1)
+            self._train_epoch(epoch)
 
             improved = False
             if (epoch + 1) % t.validate_every == 0:
@@ -212,7 +209,6 @@ class Trainer:
         if c.cleanup_epoch_checkpoints:
             self.checkpoints.cleanup_epoch_checkpoints()
 
-        self.writer.close()
         if best_metrics:
             self.logger.info("Best validation metrics: %s", _format_metrics(best_metrics))
         return best_metrics
@@ -287,9 +283,10 @@ class Trainer:
         return self.optimizer.param_groups[0]["lr"]
 
     def _log_train_step(self, loss: float) -> None:
-        """스텝별 스칼라 값을 TensorBoard에 기록한다."""
-        self.writer.add_scalar("train/loss", loss, self.global_step)
-        self.writer.add_scalar("train/lr", self._current_lr(), self.global_step)
+        """스텝별 loss/lr을 train.log에 기록한다 (log_every 주기)."""
+        self.logger.info(
+            "step %d — loss %.4f | lr %.2e", self.global_step, loss, self._current_lr()
+        )
 
     # ====================================================================== #
     #  검증 & early stopping                                                 #
@@ -299,8 +296,7 @@ class Trainer:
 
         teacher-forced 지표(loss/perplexity/정확도)를 먼저 계산하고, valid
         BLEU가 켜져 있으면 생성 기반 BLEU를 metrics dict에 추가한다. 이후
-        아래 루프가 (bleu 포함) 모든 지표를 train.log와 TensorBoard에 자동
-        기록한다.
+        모든 지표(bleu 포함)를 train.log에 기록한다.
         """
         metrics = evaluate(self.model, self.valid_loader, self.device, self.pad_id)
         if self.valid_bleu:
@@ -311,8 +307,6 @@ class Trainer:
                 min_length=self.config.inference.min_length,
             )
         self.last_val_metrics = metrics
-        for name, value in metrics.items():
-            self.writer.add_scalar(f"valid/{name}", value, epoch + 1)
         self.logger.info("epoch %d — valid %s", epoch + 1, _format_metrics(metrics))
         return metrics
 
