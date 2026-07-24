@@ -3,7 +3,7 @@
  파일: utils/mt_metrics.py
  목적:
     번역 품질 자동 평가 지표를 계산하는 재사용 헬퍼:
-    BLEU(sacreBLEU) / METEOR(NLTK) / COMET(unbabel-comet).
+    BLEU / chrF++ (sacreBLEU) / METEOR(NLTK) / COMET(unbabel-comet).
 
  역할:
     test.py가 테스트 세트를 번역한 뒤 세 지표를 함께 계산·기록하는 데
@@ -58,6 +58,37 @@ def compute_bleu(
     from sacrebleu.metrics import BLEU
 
     metric = BLEU(lowercase=lowercase)
+    score = metric.corpus_score(hypotheses, [references])
+    return score.score, metric.get_signature().format()
+
+
+def compute_chrf(
+    hypotheses: list[str],
+    references: list[str],
+    word_order: int = 2,
+    lowercase: bool = True,
+) -> tuple[float, str]:
+    """sacreBLEU chrF++와 재현용 시그니처를 계산한다.
+
+    chrF는 문자 n-gram F-score이고, ``word_order>=1``이면 단어 n-gram도 섞는다.
+    ``word_order=2``가 표준 **chrF++**(단어 bigram 포함)로, WMT가 BLEU와 함께
+    권장하는 문자열 지표다 — 형태론이 풍부한 언어에서 BLEU보다 인간평가 상관이
+    높다. BLEU와 동일하게 uncased(lowercase=True) 정책을 따른다.
+
+    Args:
+        hypotheses: 모델 번역문.
+        references: 정답 참조문.
+        word_order: 단어 n-gram 차수. 2면 chrF++, 0이면 순수 chrF.
+        lowercase: True면 대소문자 무시(uncased). 학습 코퍼스가 소문자화되어
+            모델 출력도 소문자이므로 기본 True.
+
+    Returns:
+        ``(score, signature)`` — chrF++ 점수(0~100)와 재현용 시그니처 문자열
+        (예: ``chrF2++|nrefs:1|case:lc|eff:yes|nc:6|nw:2|space:no|version:2.x``).
+    """
+    from sacrebleu.metrics import CHRF
+
+    metric = CHRF(word_order=word_order, lowercase=lowercase)  # word_order=2 => chrF++
     score = metric.corpus_score(hypotheses, [references])
     return score.score, metric.get_signature().format()
 

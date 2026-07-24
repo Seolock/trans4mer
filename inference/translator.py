@@ -4,7 +4,7 @@
  목적:
     BPE 파이프라인용 종단간 번역기: 원본 문장 -> 토큰화 -> BPE ->
     id 인코딩 -> Transformer 디코딩(greedy / 빔 서치) -> id 디코딩 ->
-    BPE 제거 -> 번역 문장.
+    BPE 제거 -> detokenize(구두점 재부착) -> 번역 문장.
 
  역할:
     test.py(테스트 세트 번역 + BLEU)와 translate.py(단일 문장 CLI)가
@@ -44,7 +44,7 @@ from trainer.checkpoint import CheckpointManager
 from utils.data_paths import codes_path, pair_dir, vocab_path
 from utils.image import build_image_transform, load_image_tensor
 from utils.misc import get_device
-from utils.text import remove_bpe, simple_tokenize
+from utils.text import detokenize, remove_bpe, simple_tokenize
 from vocab import Vocab
 
 
@@ -241,8 +241,12 @@ class Translator:
         else:
             outputs = self._greedy_search(src, max_length=gen_len, image=image)
 
-        # id -> BPE 토큰 -> 문자열 -> BPE 마커 제거.
-        return [remove_bpe(" ".join(self.tgt_vocab.decode(ids))) for ids in outputs]
+        # id -> BPE 토큰 -> 문자열 -> BPE 마커 제거 -> detokenize(구두점 재부착).
+        # detokenize로 "... velo ."를 "... velo."처럼 자연문으로 만들어야
+        # test.py의 raw 참조와 같은 기준으로 BLEU/COMET/METEOR가 계산된다.
+        return [
+            detokenize(remove_bpe(" ".join(self.tgt_vocab.decode(ids)))) for ids in outputs
+        ]
 
     def translate(self, text: str, image: Optional[str] = None) -> str:
         """문장 하나를 (선택적으로 이미지와 함께) 번역한다."""

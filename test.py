@@ -9,7 +9,7 @@
     split마다:
       1. teacher-forced 지표 (loss / perplexity / 토큰·시퀀스 정확도)
       2. 테스트 세트 전체를 실제로 번역 (빔 서치 또는 greedy)
-      3. BPE 제거 후 BLEU · METEOR · COMET 점수 계산
+      3. BPE 제거 후 BLEU · chrF++ · METEOR · COMET 점수 계산
       4. 번역 결과물을 hypo_{split}.txt로 저장
 
  역할:
@@ -64,7 +64,7 @@ from utils.data_paths import default_checkpoint_path
 from utils.image import resolve_image_path
 from utils.logger import get_logger
 from utils.misc import get_device
-from utils.mt_metrics import compute_bleu, compute_comet, compute_meteor
+from utils.mt_metrics import compute_bleu, compute_chrf, compute_comet, compute_meteor
 from utils.seed import set_seed
 
 # Multi30k 표준 테스트 세트 네 가지 (--test-splits로 이 목록을 좁힐 수 있다).
@@ -102,8 +102,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def format_metrics(metrics: dict[str, float | None]) -> str:
-    """지표 dict를 'BLEU=.. | METEOR=.. | COMET=..' 문자열로 만든다 (None은 n/a)."""
-    labels = (("bleu", "BLEU"), ("meteor", "METEOR"), ("comet", "COMET"))
+    """지표 dict를 'BLEU=.. | chrF++=.. | METEOR=.. | COMET=..' 문자열로 (None은 n/a)."""
+    labels = (("bleu", "BLEU"), ("chrf", "chrF++"), ("meteor", "METEOR"), ("comet", "COMET"))
     parts = []
     for key, label in labels:
         value = metrics.get(key)
@@ -209,6 +209,9 @@ def evaluate_split(
     bleu_score, bleu_sig = compute_bleu(hypotheses, references)
     split_logger.info("BLEU   = %.2f  (%s)", bleu_score, bleu_sig)
 
+    chrf_score, chrf_sig = compute_chrf(hypotheses, references)
+    split_logger.info("chrF++ = %.2f  (%s)", chrf_score, chrf_sig)
+
     meteor_score = compute_meteor(hypotheses, references)
     if meteor_score is not None:
         split_logger.info("METEOR = %.2f", meteor_score)
@@ -223,7 +226,12 @@ def evaluate_split(
         if comet_score is not None:
             split_logger.info("COMET  = %.2f  (%s)", comet_score, comet_model)
 
-    return {"bleu": bleu_score, "meteor": meteor_score, "comet": comet_score}
+    return {
+        "bleu": bleu_score,
+        "chrf": chrf_score,
+        "meteor": meteor_score,
+        "comet": comet_score,
+    }
 
 
 def main() -> None:
