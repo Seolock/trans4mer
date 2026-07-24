@@ -54,7 +54,7 @@ optimization:
   betas: [0.9, 0.98]
   eps: 1.0e-9
   gradient_clip: 1.0             # 전역 노름 클리핑 (0이면 비활성화)
-  scheduler: cosine              # noam | cosine | linear | constant
+  scheduler: noam                # noam(=fairseq inverse_sqrt) | cosine | linear | constant
   warmup_steps: 2000
   min_lr: 1.0e-6                 # decay 스케줄의 학습률 하한
   cosine_decay: true             # false -> warm-up 이후 학습률 고정
@@ -72,6 +72,7 @@ training:
   log_every: 50                  # N 옵티마이저 스텝마다 TensorBoard 로깅
   early_stopping_patience: 10     # 개선 없이 허용하는 검증 횟수 (0이면 비활성화)
   device: null                   # cuda | cuda:N | mps | cpu | null(자동 감지)
+  valid_bleu: true               # 매 검증마다 greedy 생성으로 valid BLEU 로깅 (비싸면 false)
 
 dataset:
   raw_dir: data/raw              # 원본 코퍼스 디렉터리 ({split}.{lang})
@@ -98,8 +99,10 @@ checkpoint:
   cleanup_epoch_checkpoints: true  # 종료 시 epoch_*.pt 전부 삭제 (last/best/ensemble은 보존)
 
 inference:
-  beam_size: 4
-  max_length: 80
+  beam_size: 5
+  max_length: 80                 # 생성 길이 절대 상한 (소스 비례 길이의 하드 캡)
+  max_len_a: 1.2                 # fairseq 소스 비례 길이: int(a*src_len + b)
+  max_len_b: 10                  # fairseq --max-len-b (상수 항)
   min_length: 1
   do_sample: false               # false -> 순수 greedy (beam_size == 1일 때)
   temperature: 1.0
@@ -109,7 +112,7 @@ inference:
   length_penalty: 1.0            # GNMT 길이 정규화 지수
 
 multimodal:                      # Multimodal MT (이미지 보강). use_image=false면 텍스트-only와 동일
-  use_image: true                # 이미지 경로 마스터 스위치 (false -> 기존 텍스트 Transformer)
+  use_image: true                # 마스터 스위치 (false -> 기존 텍스트 Transformer)
   image_dir: data/image          # raw/ 이미지들과 split별 {split}.txt 리스트를 담는 루트
   image_encoder: vit             # vit | cnn (둘 다 scratch 구현, 교체 가능)
   image_size: 384                # 정사각 리사이즈 크기
@@ -119,9 +122,8 @@ multimodal:                      # Multimodal MT (이미지 보강). use_image=f
   image_layers: 4                # ViT 블록 수 (CNN은 residual 스테이지 수)
   image_heads: 4                 # ViT self-attention 헤드 (image_embed_dim 나눠떨어짐)
   image_ffn_dim: 256             # ViT feed-forward 은닉 폭
-  fusion_type: gate              # sum | weighted | gate
-  fusion_lambda: 0.5             # weighted 융합의 고정 λ (text 비중)
-  fusion_learnable_lambda: false # true -> weighted의 λ를 학습 가능한 파라미터로
+  fusion_type: sum              # sum | weighted | gate (모두 text + lam*image 형태)
+  fusion_lambda: 0.5             # weighted 융합의 학습 가능한 λ 초기값 (image 비중)
   freeze_image_encoder: false    # true -> 이미지 인코더 동결 (기본: 번역 손실로 함께 학습)
   use_image_cache: true         # true -> preprocess_images.py로 만든 uint8 캐시(memmap)에서 로드
   image_cache_dir: data/data-bin/image  # 캐시 .npy 저장 위치 ({split}_{image_size}.npy)

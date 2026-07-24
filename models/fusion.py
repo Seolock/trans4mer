@@ -18,12 +18,16 @@
     출력         : (batch, tgt_len, d_model)  융합된 표현
 
  구현 세부사항:
-    - SumFusion    : 파라미터 없이 두 출력을 더한다.
-    - WeightedFusion: λ*text + (1-λ)*image. λ는 고정값이거나, 학습 가능한
-      파라미터(sigmoid로 (0,1) 유지)일 수 있다.
-    - GateFusion   : [text; image]로부터 게이트를 학습해 원소별로 섞는다.
+    - 모든 융합의 최종 수식은 잔차(residual) 형태로 통일되어 있다:
+      ``output = text_output + lam * image_output`` (텍스트는 항상 전량,
+      이미지는 lam으로 스케일해 더한다).
+    - SumFusion    : lam = 1 (파라미터 없음) -> text + image.
+    - WeightedFusion: lam = sigmoid(학습 가능한 스칼라) -> text + lam*image.
+      (항상 학습됨; 고정값 옵션 없음.)
+    - GateFusion   : lam = 원소별 게이트 sigmoid(Linear([text; image]))
+      -> text + gate*image.
     - 새 융합 방식은 (text, image) -> fused forward를 가진 nn.Module을
-      만들어 FUSION_REGISTRY에 등록하면 설정에서 바로 선택된다.
+      만들어 build_fusion에 등록하면 설정에서 바로 선택된다.
 ===============================================================================
 """
 
@@ -36,7 +40,8 @@ from torch import Tensor, nn
 class SumFusion(nn.Module):
     """가장 단순한 융합: 두 출력을 그대로 더한다 (파라미터 없음).
 
-    ``output = text_output + image_output``
+    ``output = text_output + image_output`` — 잔차 형태
+    ``text + lam*image``의 lam = 1 특수형이다.
     """
 
     def forward(self, text_output: Tensor, image_output: Tensor) -> Tensor:
@@ -53,32 +58,26 @@ class SumFusion(nn.Module):
 
 
 class WeightedFusion(nn.Module):
-    """가중 합 융합: ``λ * text + (1 - λ) * image``.
+    """가중 잔차 융합: ``text + λ * image``.
 
-    ``learnable=False``면 λ는 ``lambda_init`` 고정값이다. ``learnable=True``면
-    λ는 학습 가능한 스칼라 파라미터이며, sigmoid를 통과시켜 항상 (0, 1)에
+    λ는 **항상 학습 가능한** 스칼라 파라미터이며, sigmoid를 통과시켜 (0, 1)에
     머무르게 한다 (초기값은 sigmoid(logit) = lambda_init가 되도록 역산).
+    텍스트는 항상 전량 유지되고, 이미지 기여도만 λ로 조절된다.
 
     Args:
-        lambda_init: 텍스트 쪽 초기 가중치 λ (0~1).
-        learnable: λ를 학습할지 여부.
+        lambda_init: 학습 가능한 λ의 초기값 (0~1); 이미지 기여 비중.
     """
 
-    def __init__(self, lambda_init: float = 0.5, learnable: bool = False) -> None:
+    def __init__(self, lambda_init: float = 0.5) -> None:
         super().__init__()
-        self.learnable = learnable
-        if learnable:
-            # sigmoid(logit) == lambda_init가 되도록 초기 logit을 역산한다.
-            eps = 1e-6
-            clamped = min(max(lambda_init, eps), 1.0 - eps)
-            logit = torch.log(torch.tensor(clamped / (1.0 - clamped)))
-            self.lambda_logit = nn.Parameter(logit)
-        else:
-            # 학습되지 않는 상수 버퍼: 모듈과 함께 이동하지만 gradient는 없다.
-            self.register_buffer("lambda_value", torch.tensor(float(lambda_init)))
+        # sigmoid(logit) == lambda_init가 되도록 초기 logit을 역산한다.
+        eps = 1e-6
+        clamped = min(max(lambda_init, eps), 1.0 - eps)
+        logit = torch.log(torch.tensor(clamped / (1.0 - clamped)))
+        self.lambda_logit = nn.Parameter(logit)
 
     def forward(self, text_output: Tensor, image_output: Tensor) -> Tensor:
-        """λ로 가중한 두 출력의 볼록 결합을 계산한다.
+        """텍스트에 λ로 스케일한 이미지를 더한다.
 
         Args:
             text_output: ``(batch, tgt_len, d_model)``.
@@ -87,21 +86,19 @@ class WeightedFusion(nn.Module):
         Returns:
             ``(batch, tgt_len, d_model)``.
         """
-        if self.learnable:
-            lam = torch.sigmoid(self.lambda_logit)
-        else:
-            lam = self.lambda_value
-        return lam * text_output + (1.0 - lam) * image_output
+        lam = torch.sigmoid(self.lambda_logit)
+        return text_output + lam * image_output
 
 
 class GateFusion(nn.Module):
-    """게이트 융합: ``[text; image]``로부터 원소별 게이트를 학습한다.
+    """게이트 잔차 융합: ``[text; image]``로부터 원소별 게이트를 학습한다.
 
     ``gate = sigmoid(Linear([text; image]))``
-    ``output = gate * text + (1 - gate) * image``
+    ``output = text + gate * image``
 
-    게이트가 d_model 차원별로 계산되므로, 모델이 각 특징 차원마다 텍스트와
-    이미지 중 무엇을 얼마나 신뢰할지 스스로 조절할 수 있다.
+    게이트가 d_model 차원별로 계산되므로(잔차 형태의 원소별 lam), 모델이
+    각 특징 차원마다 이미지 기여도를 얼마나 반영할지 스스로 조절할 수 있다.
+    텍스트는 항상 전량 유지된다.
 
     Args:
         d_model: cross-attention 출력의 폭.
@@ -114,7 +111,7 @@ class GateFusion(nn.Module):
         self.gate = nn.Linear(2 * d_model, d_model, bias=bias)
 
     def forward(self, text_output: Tensor, image_output: Tensor) -> Tensor:
-        """학습된 게이트로 두 출력을 원소별로 섞는다.
+        """학습된 원소별 게이트로 스케일한 이미지를 텍스트에 더한다.
 
         Args:
             text_output: ``(batch, tgt_len, d_model)``.
@@ -126,7 +123,7 @@ class GateFusion(nn.Module):
         # (B, L, d_model) 두 개 -> (B, L, 2*d_model) -> 게이트 (B, L, d_model).
         combined = torch.cat([text_output, image_output], dim=-1)
         gate = torch.sigmoid(self.gate(combined))
-        return gate * text_output + (1.0 - gate) * image_output
+        return text_output + gate * image_output
 
 
 def build_fusion(fusion_type: str, d_model: int, config: "object") -> nn.Module:
@@ -146,10 +143,7 @@ def build_fusion(fusion_type: str, d_model: int, config: "object") -> nn.Module:
     if fusion_type == "sum":
         return SumFusion()
     if fusion_type == "weighted":
-        return WeightedFusion(
-            lambda_init=config.fusion_lambda,
-            learnable=config.fusion_learnable_lambda,
-        )
+        return WeightedFusion(lambda_init=config.fusion_lambda)
     if fusion_type == "gate":
         return GateFusion(d_model)
     raise ValueError(

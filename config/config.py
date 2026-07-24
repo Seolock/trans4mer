@@ -163,7 +163,7 @@ class OptimizationConfig:
     betas: tuple[float, float] = (0.9, 0.98)
     eps: float = 1e-9
     gradient_clip: float = 1.0
-    scheduler: str = "cosine"
+    scheduler: str = "noam"
     warmup_steps: int = 4000
     min_lr: float = 1e-6
     cosine_decay: bool = True
@@ -186,8 +186,12 @@ class TrainingConfig:
         log_every: N 옵티마이저 스텝마다 TensorBoard에 학습 스칼라 로깅.
         early_stopping_patience: best metric 개선 없이 N번 검증 후 학습
             중단 (0이면 early stopping 비활성화).
-        device: 사용할 디바이스 ("cuda" | "mps" | "cpu"). null이면 자동
-            감지 (CUDA -> MPS -> CPU 순).
+        device: 사용할 디바이스 ("cuda" | "cuda:N" | "mps" | "cpu").
+            null이면 자동 감지 (CUDA -> MPS -> CPU 순).
+        valid_bleu: 매 검증마다 greedy 생성으로 valid BLEU를 계산해
+            train.log / TensorBoard에 로깅할지 여부. 생성은 teacher-forced
+            평가보다 비싸므로, 부담되면 false로 끄거나 validate_every로
+            빈도를 조절한다 (fairseq --eval-bleu에 해당).
     """
 
     batch_size: int = 64
@@ -201,6 +205,7 @@ class TrainingConfig:
     log_every: int = 50
     early_stopping_patience: int = 5
     device: Optional[str] = None
+    valid_bleu: bool = True
 
 
 @dataclass
@@ -274,7 +279,8 @@ class CheckpointConfig:
         resume_checkpoint: 학습을 이어갈 체크포인트 경로 ("" / null이면
             비활성화).
         best_metric: "최고" 모델을 정의하는 검증 지표
-            ("loss", "perplexity", "token_accuracy" 또는 "accuracy").
+            ("loss", "perplexity", "token_accuracy", "accuracy" 또는 "bleu").
+            "bleu"를 쓰려면 training.valid_bleu가 켜져 있어야 한다.
         save_ensemble: 학습 종료 시 최근 epoch 체크포인트들을 가중치
             평균(checkpoint averaging)하여 단일 ensemble.pt로 저장할지 여부.
         ensemble_last_n: 앙상블 평균에 사용할 최근 epoch 체크포인트 개수.
@@ -298,7 +304,12 @@ class InferenceConfig:
     Attributes:
         beam_size: 빔 서치에 사용할 빔 개수 (1이면 greedy/샘플링으로
             대체됨).
-        max_length: 최대 생성 길이 (model.max_seq_length로 상한이 걸림).
+        max_length: 생성 길이의 절대 상한 (model.max_seq_length로도 상한이
+            걸림). 소스 비례 길이(max_len_a/max_len_b)의 하드 캡 역할.
+        max_len_a: fairseq 스타일 소스 비례 길이 계수. 배치별 최대 생성
+            길이 = min(int(max_len_a·src_len + max_len_b), max_length,
+            model.max_seq_length-1).
+        max_len_b: 소스 비례 길이의 상수 항 (fairseq --max-len-b).
         min_length: EOS가 허용되기 전 최소 길이.
         do_sample: argmax 대신 필터링된 분포에서 샘플링 (greedy 디코딩은
             temperature/top-k/top-p를 무시함).
@@ -311,6 +322,8 @@ class InferenceConfig:
 
     beam_size: int = 4
     max_length: int = 128
+    max_len_a: float = 1.2
+    max_len_b: int = 10
     min_length: int = 1
     do_sample: bool = False
     temperature: float = 1.0
@@ -353,10 +366,8 @@ class MultimodalConfig:
         image_ffn_dim: ViT feed-forward 은닉 폭.
         fusion_type: 두 cross-attention 출력을 합치는 방식.
             "sum" | "weighted" | "gate".
-        fusion_lambda: "weighted" 융합의 고정 가중치 λ (text 쪽 비중);
-            출력 = λ*text + (1-λ)*image.
-        fusion_learnable_lambda: true면 "weighted"의 λ를 학습 가능한
-            파라미터로 둔다 (sigmoid로 (0,1) 유지). false면 fusion_lambda 고정.
+        fusion_lambda: "weighted" 융합의 학습 가능한 λ 초기값 (0~1;
+            이미지 기여 비중). 출력 = text + λ*image이며 λ는 항상 학습된다.
         freeze_image_encoder: true면 이미지 인코더 파라미터를 동결한다
             (기본은 false — 번역 손실로 함께 학습).
         use_image_cache: true면 매 스텝 JPEG를 디코딩/리사이즈하지 않고,
@@ -379,7 +390,6 @@ class MultimodalConfig:
     image_ffn_dim: int = 1024
     fusion_type: str = "gate"
     fusion_lambda: float = 0.5
-    fusion_learnable_lambda: bool = False
     freeze_image_encoder: bool = False
     use_image_cache: bool = False
     image_cache_dir: str = "data/image/cache"
@@ -503,7 +513,7 @@ class Config:
             raise ValueError(f"Invalid scheduler '{o.scheduler}'")
         if o.optimizer not in ("adam", "adamw", "sgd"):
             raise ValueError(f"Invalid optimizer '{o.optimizer}'")
-        if c.best_metric not in ("loss", "perplexity", "token_accuracy", "accuracy"):
+        if c.best_metric not in ("loss", "perplexity", "token_accuracy", "accuracy", "bleu"):
             raise ValueError(f"Invalid best_metric '{c.best_metric}'")
         if self.training.accumulation_steps < 1:
             raise ValueError("training.accumulation_steps must be >= 1")

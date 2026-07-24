@@ -45,6 +45,7 @@ _HIGHER_IS_BETTER: dict[str, bool] = {
     "perplexity": False,
     "token_accuracy": True,
     "accuracy": True,
+    "bleu": True,
 }
 
 

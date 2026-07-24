@@ -21,8 +21,9 @@
  구현 세부사항:
     - `padding_idx`는 패딩 벡터를 0으로 만들고 gradient를 얼려서, 패딩
       위치가 아무 신호도 전달하지 않게 한다.
-    - 전역 Xavier 초기화가 이 0으로 채워진 패딩 행을 덮어쓰기 때문에,
-      Transformer는 초기화 후 `reset_padding_vector()`를 호출해 복원한다.
+    - 전역 Xavier 초기화가 임베딩 테이블을 덮어쓰기 때문에, Transformer는
+      초기화 후 `reset_parameters()`를 호출해 fairseq 방식(normal(0,
+      d_model^-0.5))으로 임베딩을 다시 초기화하고 패딩 행을 0으로 복원한다.
 ===============================================================================
 """
 
@@ -60,6 +61,20 @@ class TokenEmbedding(nn.Module):
         """패딩 행을 다시 0으로 만든다 (전역 재초기화 이후에 호출)."""
         with torch.no_grad():
             self.embedding.weight[self.pad_id].fill_(0.0)
+
+    def reset_parameters(self) -> None:
+        """토큰 임베딩을 fairseq 방식으로 초기화한다.
+
+        전역 Xavier 초기화(models/utils.py:init_xavier)가 임베딩 테이블까지
+        덮어쓰므로, Transformer가 그 이후에 이 메서드를 호출해 임베딩만
+        fairseq의 ``normal_(0, d_model^-0.5)``로 다시 초기화하고 패딩 행을
+        0으로 되돌린다. Linear/Conv 등 다른 행렬은 Xavier를 그대로 유지한다.
+        """
+        with torch.no_grad():
+            nn.init.normal_(
+                self.embedding.weight, mean=0.0, std=self.embedding.embedding_dim**-0.5
+            )
+        self.reset_padding_vector()
 
     def forward(self, token_ids: Tensor) -> Tensor:
         """임베딩을 조회(하고 스케일링)한다.

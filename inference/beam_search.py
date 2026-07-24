@@ -2,7 +2,7 @@
 ===============================================================================
  파일: inference/beam_search.py
  목적:
-    GNMT 길이 정규화를 적용한 배치 빔 서치(beam search) 디코딩.
+    fairseq 스타일 길이 정규화를 적용한 배치 빔 서치(beam search) 디코딩.
 
  역할:
     고품질 디코딩 전략. 매 스텝마다 단 하나의 최선 토큰에 확정하는(greedy)
@@ -24,9 +24,11 @@
       않으면 top-k가 같은 토큰의 K개 복사본을 골라버릴 것이다.
     - 매 스텝마다 예제당 상위 2K개의 후보를 취한다: 이 중 K개가 EOS로
       끝나 완료된 목록으로 물러나더라도, K개의 살아있는 빔이 남는다.
-    - 완료된 가설은 score / lp(length)로 순위가 매겨지며
-      lp(n) = ((5 + n) / 6)^alpha (Wu et al., 2016) — 이것이 없으면
-      더 긴 출력이 추가 로그 확률 항 때문에 부당하게 불이익을 받는다.
+    - 완료된 가설은 fairseq 방식으로 score / length^lenpen 순위가 매겨진다
+      — 이것이 없으면 더 긴 출력이 추가 로그 확률 항 때문에 부당하게
+      불이익을 받는다.
+    - max_length에 도달했는데 완료 가설이 부족한 예제는, 살아있는 빔들도
+      같은 길이 정규화 점수로 finalize해 완료 가설과 일관되게 비교한다.
     - `min_length` 이전에는 EOS가 금지된다.
     - KV 캐시 없음: 매 스텝마다 전체 prefix에 대해 디코더를 다시 실행한다.
       명확하지만 정석적인 방법이다; 캐싱이 자연스러운 첫 번째
@@ -53,7 +55,8 @@ class BeamSearchDecoder:
         beam_size: 예제당 유지할 살아있는 가설 개수.
         max_length: 생성할 최대 토큰 개수.
         min_length: 이 개수보다 적게 생성된 시점에서는 EOS가 마스킹됨.
-        length_penalty: GNMT alpha; 0이면 길이 정규화를 비활성화.
+        length_penalty: fairseq lenpen 지수 (score/length^lenpen); 0이면
+            길이 정규화를 비활성화, 1이면 순수 토큰당 평균.
     """
 
     def __init__(
@@ -65,7 +68,7 @@ class BeamSearchDecoder:
         beam_size: int = 4,
         max_length: int = 64,
         min_length: int = 1,
-        length_penalty: float = 0.6,
+        length_penalty: float = 1.0,
     ) -> None:
         self.model = model
         self.bos_id = bos_id
@@ -77,10 +80,11 @@ class BeamSearchDecoder:
         self.length_penalty = length_penalty
 
     def _length_normalized(self, score: float, length: int) -> float:
-        """GNMT 길이 페널티: score / ((5 + length) / 6) ** alpha."""
-        if self.length_penalty == 0.0:
-            return score
-        return score / (((5.0 + length) / 6.0) ** self.length_penalty)
+        """fairseq 길이 페널티: score / (length ** lenpen).
+
+        lenpen=0 -> length^0=1 (정규화 없음), lenpen=1 -> 순수 토큰당 평균.
+        """
+        return score / (max(length, 1) ** self.length_penalty)
 
     @torch.no_grad()
     def search(self, src: Tensor, image: Tensor | None = None) -> list[list[int]]:
@@ -197,13 +201,17 @@ class BeamSearchDecoder:
         # --------------------------------------------------------- 결과
         results: list[list[int]] = []
         for b in range(batch_size):
-            if finished[b]:
-                best_score, best_tokens = max(finished[b], key=lambda item: item[0])
-                results.append(best_tokens)
-            else:
-                # EOS 없이 길이가 소진됨: 살아있는 최선의 빔으로 대체한다
-                # (해당 행들은 b*K .. b*K+K-1이며, 최고 점수가 이긴다).
-                rows = slice(b * beam_size, (b + 1) * beam_size)
-                best_row = int(torch.argmax(scores[rows]).item()) + b * beam_size
-                results.append(sequences[best_row, 1:].tolist())
+            # 완료 가설을 beam_size만큼 못 채운 예제(example_done=False)는 아직
+            # 살아있는 빔이 유효하다 (done 예제의 행은 placeholder라 제외). 이
+            # 살아있는 빔들도 완료 가설과 '같은' 길이 정규화 점수로 finalize해
+            # 함께 비교한다 (fairseq: max_len 도달 시 active 가설 finalize).
+            if not example_done[b]:
+                for k in range(beam_size):
+                    row = b * beam_size + k
+                    tokens = sequences[row, 1:].tolist()
+                    finished[b].append(
+                        (self._length_normalized(float(scores[row].item()), len(tokens)), tokens)
+                    )
+            best_score, best_tokens = max(finished[b], key=lambda item: item[0])
+            results.append(best_tokens)
         return results

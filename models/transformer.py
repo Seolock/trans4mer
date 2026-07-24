@@ -39,7 +39,8 @@
                                    묶음 (tie_output_projection을 함의)
         tie_output_projection   -> generator.weight가 디코더 임베딩
                                    가중치와 *같은* Parameter 객체가 됨
-    - Xavier 초기화가 모든 행렬에 걸쳐 실행된 뒤, 임베딩 패딩 행을 다시
+    - Xavier 초기화가 모든 행렬에 걸쳐 실행된 뒤, 텍스트 토큰 임베딩만
+      fairseq 방식(normal(0, d_model^-0.5))으로 다시 초기화하고 패딩 행을
       0으로 만든다 (그렇지 않으면 Xavier가 패딩 토큰에도 신호를 줄 것임).
     - 마스크는 프로젝트 전역 규칙(True = 어텐션 가능)을 따른다;
       models/utils.py 참고.
@@ -136,9 +137,12 @@ class Transformer(nn.Module):
         self.generator = nn.Linear(m.d_model, tgt_vocab_size, bias=m.bias and not tie_generator)
 
         # ---------------------------------------------------------- 초기화
+        # 전역 Xavier로 모든 행렬(이미지 인코더 Conv/ViT 포함)을 초기화한 뒤,
+        # 텍스트 토큰 임베딩만 fairseq 방식(normal(0, d_model^-0.5))으로
+        # 다시 초기화하고 패딩 행을 0으로 되돌린다.
         init_xavier(self)
-        src_token_embedding.reset_padding_vector()
-        tgt_token_embedding.reset_padding_vector()
+        src_token_embedding.reset_parameters()
+        tgt_token_embedding.reset_parameters()
         if tie_generator:
             # 초기화 *이후에* 대입해서 tying이 유지되도록 한다; 이제 두
             # 모듈이 같은 Parameter 객체를 가지며 gradient가 합산된다.

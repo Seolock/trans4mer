@@ -48,10 +48,11 @@ from tqdm import tqdm
 
 from config.config import Config, OptimizationConfig
 from trainer.checkpoint import CheckpointManager
-from trainer.evaluator import evaluate
+from trainer.evaluator import evaluate, evaluate_bleu
 from trainer.scheduler import build_scheduler
 from utils.logger import get_logger
 from utils.misc import AverageMeter, move_to_device
+from vocab import Vocab
 
 
 def build_optimizer(model: nn.Module, config: OptimizationConfig) -> torch.optim.Optimizer:
@@ -93,6 +94,8 @@ class Trainer:
         train_loader: 학습 분할에 대한 loader.
         valid_loader: 검증 분할에 대한 loader.
         device: 학습할 디바이스.
+        tgt_vocab: 타겟 어휘집 (검증 중 생성 기반 valid BLEU 계산에 사용;
+            None이거나 training.valid_bleu가 false면 BLEU를 건너뛴다).
     """
 
     def __init__(
@@ -102,6 +105,7 @@ class Trainer:
         train_loader: DataLoader,
         valid_loader: DataLoader,
         device: torch.device,
+        tgt_vocab: Optional[Vocab] = None,
     ) -> None:
         self.config = config
         self.model = model
@@ -113,6 +117,15 @@ class Trainer:
         t, o, c = config.training, config.optimization, config.checkpoint
         self.accumulation_steps = max(1, t.accumulation_steps)
         self.logger = get_logger("trainer", log_file=Path(c.save_dir) / "train.log")
+
+        # ------------------------------------------------ valid BLEU (생성 기반)
+        # tgt_vocab이 있고 training.valid_bleu가 켜졌을 때만 매 검증마다 greedy
+        # 생성으로 BLEU를 계산한다. 생성 길이는 translator와 동일 규칙.
+        self.tgt_vocab = tgt_vocab
+        self.valid_bleu = t.valid_bleu and tgt_vocab is not None
+        self.gen_max_length = min(config.inference.max_length, config.model.max_seq_length - 1)
+        if t.valid_bleu and tgt_vocab is None:
+            self.logger.warning("training.valid_bleu=true 이지만 tgt_vocab이 없어 BLEU를 건너뜁니다")
 
         # ------------------------------------------------ loss & 최적화
         self.criterion = nn.CrossEntropyLoss(
@@ -282,8 +295,21 @@ class Trainer:
     #  검증 & early stopping                                                 #
     # ====================================================================== #
     def _validate(self, epoch: int) -> dict[str, float]:
-        """검증 분할에 대해 평가하고 결과를 로깅한다."""
+        """검증 분할에 대해 평가하고 결과를 로깅한다.
+
+        teacher-forced 지표(loss/perplexity/정확도)를 먼저 계산하고, valid
+        BLEU가 켜져 있으면 생성 기반 BLEU를 metrics dict에 추가한다. 이후
+        아래 루프가 (bleu 포함) 모든 지표를 train.log와 TensorBoard에 자동
+        기록한다.
+        """
         metrics = evaluate(self.model, self.valid_loader, self.device, self.pad_id)
+        if self.valid_bleu:
+            assert self.tgt_vocab is not None  # valid_bleu는 tgt_vocab이 있을 때만 True
+            metrics["bleu"] = evaluate_bleu(
+                self.model, self.valid_loader, self.device, self.tgt_vocab,
+                max_length=self.gen_max_length,
+                min_length=self.config.inference.min_length,
+            )
         self.last_val_metrics = metrics
         for name, value in metrics.items():
             self.writer.add_scalar(f"valid/{name}", value, epoch + 1)

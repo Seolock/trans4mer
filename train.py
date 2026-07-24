@@ -27,7 +27,10 @@
       forcing(입력 [BOS..yn] -> 타겟 [y1..EOS])은 Trainer/collate에 이미
       구현되어 있다.
     - best 체크포인트는 validation loss 기준으로 저장된다
-      (checkpoint.best_metric으로 변경 가능). BLEU는 test.py에서 계산.
+      (checkpoint.best_metric으로 변경 가능).
+    - 학습 중 valid BLEU는 매 검증마다 greedy 생성으로 계산되어 train.log와
+      TensorBoard에 기록된다 (training.valid_bleu). 최종 test BLEU는 여전히
+      test.py가 빔서치로 계산한다.
 ===============================================================================
 """
 
@@ -138,6 +141,7 @@ def main() -> None:
         train_loader=loaders["train"],
         valid_loader=loaders["valid"],
         device=device,
+        tgt_vocab=tgt_vocab,  # 검증 중 생성 기반 valid BLEU 로깅에 사용
     )
     trainer.fit()
 

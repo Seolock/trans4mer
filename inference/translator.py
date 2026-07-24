@@ -22,8 +22,9 @@
       그대로 재사용한다 (id 기반이라 어휘집 종류와 무관).
     - greedy는 argmax 루프로 직접 구현 (inference.min_length 존중,
       완료된 행은 패딩을 이어 붙여 배치 형태 유지).
-    - 생성 길이는 inference.max_length와 model.max_seq_length 중 작은
-      값으로 상한이 걸린다.
+    - 생성 길이는 fairseq 방식으로 소스 길이에 비례해 정한다:
+      int(max_len_a*src_len + max_len_b), 단 inference.max_length와
+      model.max_seq_length-1을 하드 캡으로 상한한다.
 ===============================================================================
 """
 
@@ -37,6 +38,7 @@ from torch import Tensor
 
 from config.config import Config
 from inference.beam_search import BeamSearchDecoder
+from inference.decode import greedy_decode
 from models.transformer import Transformer
 from trainer.checkpoint import CheckpointManager
 from utils.data_paths import codes_path, pair_dir, vocab_path
@@ -73,8 +75,11 @@ class Translator:
         self.bpe = bpe
         self.config = config
         self.device = device
-        # positional encoding이 지원하는 길이를 절대 넘지 않도록 한다.
-        self.max_length = min(config.inference.max_length, config.model.max_seq_length - 1)
+        # positional encoding이 지원하는 길이를 절대 넘지 않는 하드 캡.
+        self.max_len_cap = min(config.inference.max_length, config.model.max_seq_length - 1)
+        # fairseq 스타일 소스 비례 생성 길이 계수 (배치별로 실제 길이를 계산).
+        self.max_len_a = config.inference.max_len_a
+        self.max_len_b = config.inference.max_len_b
         # Multimodal: 이미지 전처리 transform을 한 번만 만들어 재사용한다.
         self.use_image = config.multimodal.use_image
         self.image_transform = (
@@ -174,53 +179,29 @@ class Translator:
         return torch.stack(tensors, dim=0).to(self.device)
 
     # -------------------------------------------------------------- 디코딩
-    @torch.no_grad()
-    def _greedy_search(self, src: Tensor, image: Tensor | None = None) -> list[list[int]]:
-        """argmax greedy 디코딩.
+    def _greedy_search(
+        self, src: Tensor, max_length: int, image: Tensor | None = None
+    ) -> list[list[int]]:
+        """argmax greedy 디코딩 (재사용 가능한 inference.decode.greedy_decode 위임).
 
         Args:
             src: ``(batch, src_len)`` 오른쪽 패딩된 소스 id.
+            max_length: 이 배치의 최대 생성 길이 (소스 비례로 계산됨).
             image: ``(batch, C, H, W)`` 이미지 텐서 (Multimodal), 또는 None.
 
         Returns:
             예제마다 생성된 타겟 id 리스트 (BOS/EOS 제외).
         """
-        bos, eos, pad = self.tgt_vocab.bos_id, self.tgt_vocab.eos_id, self.tgt_vocab.pad_id
-        batch_size = src.size(0)
-
-        # 소스(와 이미지)는 한 번만 인코딩한다.
-        src_mask = self.model.make_source_mask(src)
-        memory = self.model.encode(src, src_mask)
-        image_memory = self.model.encode_image(image) if image is not None else None
-
-        sequences = torch.full((batch_size, 1), bos, dtype=torch.long, device=self.device)
-        alive = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-
-        for step in range(1, self.max_length + 1):
-            decoded = self.model.decode(
-                sequences, memory, memory_mask=src_mask, image_memory=image_memory
-            )
-            logits = self.model.generator(decoded[:, -1, :]).float()
-            if step <= self.config.inference.min_length:
-                logits[:, eos] = float("-inf")  # 최소 길이 강제
-            next_token = logits.argmax(dim=-1)
-            # 완료된 행은 배치 형태 유지를 위해 계속 패딩을 낸다.
-            next_token = torch.where(alive, next_token, torch.full_like(next_token, pad))
-            sequences = torch.cat([sequences, next_token.unsqueeze(1)], dim=1)
-            alive = alive & (next_token != eos)
-            if not alive.any():
-                break
-
-        # BOS 제거, EOS/패딩에서 자르기.
-        results: list[list[int]] = []
-        for row in sequences[:, 1:].tolist():
-            tokens: list[int] = []
-            for token_id in row:
-                if token_id in (eos, pad):
-                    break
-                tokens.append(token_id)
-            results.append(tokens)
-        return results
+        return greedy_decode(
+            self.model,
+            src,
+            bos_id=self.tgt_vocab.bos_id,
+            eos_id=self.tgt_vocab.eos_id,
+            pad_id=self.tgt_vocab.pad_id,
+            max_length=max_length,
+            min_length=self.config.inference.min_length,
+            image=image,
+        )
 
     # ------------------------------------------------------------ 공개 API
     def translate_batch(
@@ -238,6 +219,10 @@ class Translator:
         """
         inf = self.config.inference
         src = self._encode_batch(texts)
+        # fairseq 스타일 소스 비례 최대 생성 길이: 배치 내 최대 소스 길이(패딩
+        # 제외)를 기준으로 int(a*src_len + b)를 계산하고 하드 캡으로 상한.
+        src_len = int((src != self.src_vocab.pad_id).sum(dim=1).max())
+        gen_len = min(int(self.max_len_a * src_len + self.max_len_b), self.max_len_cap)
         # use_image이고 이미지 경로가 주어졌을 때만 이미지 텐서를 만든다.
         image = self._encode_images(images) if (self.use_image and images is not None) else None
 
@@ -248,13 +233,13 @@ class Translator:
                 eos_id=self.tgt_vocab.eos_id,
                 pad_id=self.tgt_vocab.pad_id,
                 beam_size=inf.beam_size,
-                max_length=self.max_length,
+                max_length=gen_len,
                 min_length=inf.min_length,
                 length_penalty=inf.length_penalty,
             )
             outputs = decoder.search(src, image=image)
         else:
-            outputs = self._greedy_search(src, image=image)
+            outputs = self._greedy_search(src, max_length=gen_len, image=image)
 
         # id -> BPE 토큰 -> 문자열 -> BPE 마커 제거.
         return [remove_bpe(" ".join(self.tgt_vocab.decode(ids))) for ids in outputs]
