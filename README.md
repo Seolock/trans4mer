@@ -5,11 +5,12 @@
 
 ---
 
-## 설치
-
 ```bash
 pip install -r requirements.txt
 ```
+
+COMET 지표는 `unbabel-comet`이 torch 2.1+를 요구해 기본에서 제외되어 있습니다.
+미설치 시 자동으로 건너뛰며 BLEU / chrF++ / METEOR는 그대로 계산됩니다.
 
 ## 데이터 준비
 

@@ -21,8 +21,10 @@
     - "더 나음"은 지표에 따라 다르다: loss/perplexity -> 낮을수록 좋음,
       accuracy들 -> 높을수록 좋음. `_HIGHER_IS_BETTER`에 한 번만
       인코딩되어 있다.
-    - 체크포인트에는 텐서와 일반 Python 컨테이너만 담기므로 여기서
-      `torch.load(weights_only=True)`가 안전하다.
+    - 체크포인트에는 텐서와 일반 Python 컨테이너만 담는다. `weights_only`
+      인자는 torch 1.13+에만 있으므로(1.12는 pickle 인자로 오인해 TypeError)
+      명시하지 않는다 — 담기는 내용이 이미 weights-only로 로드 가능하므로
+      기본값이 True인 torch 2.6+에서도 그대로 읽힌다.
     - 파일: last.pt (항상), best.pt (개선 시), epoch_%03d.pt
       (`save_every` epoch마다).
 ===============================================================================
@@ -217,4 +219,4 @@ class CheckpointManager:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {path}")
-        return torch.load(path, map_location=map_location, weights_only=True)
+        return torch.load(path, map_location=map_location)

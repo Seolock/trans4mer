@@ -24,7 +24,10 @@
     - Gradient 누적: 각 micro-batch의 loss를 accumulation_steps로 나눈다;
       옵티마이저는 누적 경계에서 그리고 epoch의 마지막(부분적일 수 있는)
       배치에서 스텝된다.
-    - AMP: torch.amp autocast + GradScaler, CUDA에서만 활성화된다.
+    - AMP: torch.cuda.amp GradScaler + CUDA 전용 autocast, CUDA에서만
+      활성화된다. torch 1.12의 autocast는 device_type으로 'cuda'/'cpu'/'xpu'
+      만 받으므로('mps'는 enabled=False여도 RuntimeError), AMP가 꺼져 있으면
+      아예 컨텍스트에 진입하지 않는다.
       클리핑 임계값이 실제(진짜) 단위가 되도록 클리핑 전에 gradient의
       스케일을 되돌린다(unscale).
     - 스케줄러는 매 OPTIMIZER 스텝마다 한 번씩 스텝된다; total_steps는
@@ -36,12 +39,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 from pathlib import Path
 from typing import Any, Optional
 
 import torch
 from torch import amp, nn
+from torch.cuda.amp import GradScaler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -82,6 +87,25 @@ def build_optimizer(model: nn.Module, config: OptimizationConfig) -> torch.optim
             weight_decay=config.weight_decay,
         )
     raise ValueError(f"Unknown optimizer '{config.optimizer}'")
+
+
+def autocast_context(enabled: bool) -> contextlib.AbstractContextManager:
+    """AMP autocast 컨텍스트를 만든다 (꺼져 있으면 no-op).
+
+    torch 1.12의 autocast는 device_type으로 'cuda'/'cpu'/'xpu'만 받고, 그 외
+    (예: 'mps')는 ``enabled=False``여도 생성자에서 RuntimeError를 던진다.
+    AMP는 CUDA에서만 켜지므로(Trainer.amp_enabled) 켜졌을 때만 'cuda'
+    autocast에 진입하고, 그 외에는 nullcontext를 돌려준다.
+
+    Args:
+        enabled: AMP 활성화 여부 (= CUDA이고 mixed_precision이 켜져 있음).
+
+    Returns:
+        ``with``에 바로 쓸 수 있는 컨텍스트 매니저.
+    """
+    if not enabled:
+        return contextlib.nullcontext()
+    return amp.autocast(device_type="cuda")
 
 
 class Trainer:
@@ -168,7 +192,9 @@ class Trainer:
         self.amp_enabled = t.mixed_precision and device.type == "cuda"
         if t.mixed_precision and not self.amp_enabled:
             self.logger.warning("mixed_precision requested but no CUDA device — running FP32")
-        self.scaler = amp.GradScaler("cuda", enabled=self.amp_enabled)
+        # torch.cuda.amp.GradScaler: 1.12와 2.x 양쪽에 존재한다
+        # (torch.amp.GradScaler는 2.3+ 전용).
+        self.scaler = GradScaler(enabled=self.amp_enabled)
 
         # -------------------------------------------------------- 체크포인트
         self.checkpoints = CheckpointManager(c.save_dir, metric_name=c.best_metric)
@@ -301,7 +327,7 @@ class Trainer:
         flat_targets = targets.reshape(-1)
         caption_value = 0.0
 
-        with amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+        with autocast_context(self.amp_enabled):
             # batch.get("image"): Multimodal이면 (B, C, H, W) 이미지 텐서,
             # 텍스트-only면 None (모델이 이미지 경로를 건너뛴다).
             # 캡션 손실이 켜져 있으면 image_memory를 함께 받아 재사용한다

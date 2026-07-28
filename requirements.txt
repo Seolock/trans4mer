@@ -1,6 +1,7 @@
-# 핵심
-torch>=2.3
-torchvision>=0.20
+Python==3.10
+torch==1.12.0
+torchvision==0.13.0
+numpy<2
 
 # 설정 & CLI
 PyYAML>=6.0
@@ -15,5 +16,11 @@ matplotlib>=3.8
 subword-nmt>=0.3.8
 sacrebleu>=2.4
 nltk>=3.8
-unbabel-comet>=2.2
 setuptools<81
+
+# COMET (선택) — torch 1.12와 함께 설치할 수 없다:
+#   unbabel-comet>=2.2 -> pytorch-lightning>=2.0 -> torch>=2.1
+# 미설치 시 utils/mt_metrics.py의 compute_comet()이 ImportError를 잡아 None을
+# 반환하고, test.py는 COMET을 n/a로 출력한다 (BLEU/chrF++/METEOR는 정상).
+# torch 2.1+ 환경에서만 아래 주석을 해제할 것.
+# unbabel-comet>=2.2
