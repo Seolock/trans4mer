@@ -23,7 +23,7 @@ model:
   num_encoder_layers: 4
   num_decoder_layers: 4
   dim_feedforward: 256           # FFN 은닉 폭 (보통 d_model의 4배)
-  dropout: 0.1                   # feed-forward 네트워크 내부 dropout
+  dropout: 0.3                   # feed-forward 네트워크 내부 dropout
   activation: relu               # relu | gelu | silu | tanh
   layer_norm_eps: 1.0e-5
   bias: true                     # FFN / 출력 프로젝션의 bias 항
@@ -49,14 +49,14 @@ attention:
 
 optimization:
   optimizer: adamw               # adam | adamw | sgd
-  learning_rate: 5.0e-4          # warm-up 이후의 최대(peak) 학습률
+  learning_rate: 5.0e-3          # warm-up 이후의 최대(peak) 학습률
   weight_decay: 0.01
   betas: [0.9, 0.98]
   eps: 1.0e-9
   gradient_clip: 1.0             # 전역 노름 클리핑 (0이면 비활성화)
   scheduler: noam                # noam(=fairseq inverse_sqrt) | cosine | linear | constant
   warmup_steps: 2000
-  min_lr: 1.0e-6                 # decay 스케줄의 학습률 하한
+  min_lr: 1.0e-9                 # decay 스케줄의 학습률 하한
   cosine_decay: true             # false -> warm-up 이후 학습률 고정
   label_smoothing: 0.1
 
