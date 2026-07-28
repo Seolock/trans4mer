@@ -53,6 +53,7 @@ from __future__ import annotations
 
 from typing import Optional
 
+import torch
 from torch import Tensor, nn
 
 from config.config import Config
@@ -116,10 +117,11 @@ class DecoderLayer(nn.Module):
     def _cross_attend(
         self,
         query: Tensor,
-        memory: Tensor,
+        memory: Optional[Tensor],
         memory_mask: Optional[Tensor],
         image_memory: Optional[Tensor],
         image_mask: Optional[Tensor],
+        skip_text: bool = False,
     ) -> Tensor:
         """Text (+ Image) cross-attention을 수행하고 결과를 Fusion으로 합친다.
 
@@ -128,16 +130,42 @@ class DecoderLayer(nn.Module):
         어텐션한다. use_image가 아니거나 image_memory가 없으면 텍스트
         cross-attention 결과를 그대로 반환한다 (텍스트-only와 동일).
 
+        ``skip_text=True``는 캡셔닝 보조 태스크(번역 디코더 공유 모드)를 위한
+        경로다: 텍스트 cross-attention을 아예 호출하지 않고 이미지 기여만
+        남긴다. 이때도 **Fusion은 반드시 경유**시켜(텍스트 자리에 0을 넣어)
+        fusion 파라미터까지 보조 손실 gradient를 받게 한다. Fusion이 잔차
+        형태(``text + lam*image``)이므로 text=0이면 자연히 ``lam*image``만
+        남는다.
+
         Args:
             query: ``(batch, tgt_len, d_model)`` cross-attention 쿼리.
-            memory: ``(batch, src_len, d_model)`` 텍스트 인코더 출력.
+            memory: ``(batch, src_len, d_model)`` 텍스트 인코더 출력
+                (``skip_text=True``면 사용되지 않으므로 None 가능).
             memory_mask: 텍스트 cross-attention 소스-패딩 마스크.
             image_memory: ``(batch, num_patches, d_model)`` 이미지 인코더 출력 또는 None.
             image_mask: 이미지 cross-attention 마스크 또는 None.
+            skip_text: True면 텍스트 cross-attention을 건너뛰고 이미지 기여만
+                Fusion을 통과시킨다 (캡셔닝 보조 태스크 전용).
 
         Returns:
             ``(batch, tgt_len, d_model)`` (융합된) cross-attention 출력.
+
+        Raises:
+            ValueError: ``skip_text=True``인데 이미지 경로가 없을 때
+                (use_image=false이거나 image_memory가 None).
         """
+        if skip_text:
+            if not (self.use_image and image_memory is not None):
+                raise ValueError(
+                    "skip_text=True는 이미지 cross-attention 경로가 필요합니다 "
+                    "(multimodal.use_image=true이고 image_memory가 있어야 함)."
+                )
+            image_output = self.image_cross_attention(
+                query=query, key=image_memory, value=image_memory, mask=image_mask
+            )
+            # 텍스트 기여를 0으로 두고 Fusion을 경유 -> fusion 파라미터도 학습된다.
+            return self.fusion(torch.zeros_like(image_output), image_output)
+
         text_output = self.cross_attention(
             query=query, key=memory, value=memory, mask=memory_mask
         )
@@ -151,11 +179,12 @@ class DecoderLayer(nn.Module):
     def forward(
         self,
         x: Tensor,
-        memory: Tensor,
+        memory: Optional[Tensor] = None,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         image_memory: Optional[Tensor] = None,
         image_mask: Optional[Tensor] = None,
+        skip_text_cross_attention: bool = False,
     ) -> Tensor:
         """설정된 정규화 배치에 따라 세 서브레이어를 실행한다.
 
@@ -172,6 +201,9 @@ class DecoderLayer(nn.Module):
             memory_mask: 텍스트 cross-attention을 위한 소스-패딩 마스크.
             image_memory: ``(batch, num_patches, d_model)`` 이미지 인코더 출력 또는 None.
             image_mask: 이미지 cross-attention 마스크 또는 None.
+            skip_text_cross_attention: True면 텍스트 cross-attention을 건너뛰고
+                이미지 기여만 사용한다 (캡셔닝 보조 태스크의 디코더 공유 모드;
+                :meth:`_cross_attend` 참고). 이때 ``memory``는 무시된다.
 
         Returns:
             ``(batch, tgt_len, d_model)`` 정제된 타겟 표현.
@@ -191,7 +223,10 @@ class DecoderLayer(nn.Module):
             # 쿼리는 디코더에서, 키/값은 각각 텍스트/이미지 memory에서 온다.
             residual = x
             normed = self.cross_attention_norm(x)
-            attended = self._cross_attend(normed, memory, memory_mask, image_memory, image_mask)
+            attended = self._cross_attend(
+                normed, memory, memory_mask, image_memory, image_mask,
+                skip_text=skip_text_cross_attention,
+            )
             x = residual + self.residual_dropout(attended)
 
             # ======================= Feed Forward (Pre-LN) =======================
@@ -211,7 +246,10 @@ class DecoderLayer(nn.Module):
             # [Text Cross-Attn (+ Image Cross-Attn -> Fusion)] -> Dropout ->
             # Residual 덧셈 -> LayerNorm.
             residual = x
-            attended = self._cross_attend(x, memory, memory_mask, image_memory, image_mask)
+            attended = self._cross_attend(
+                x, memory, memory_mask, image_memory, image_mask,
+                skip_text=skip_text_cross_attention,
+            )
             x = self.cross_attention_norm(residual + self.residual_dropout(attended))
 
             # ======================= Feed Forward (Post-LN) ======================

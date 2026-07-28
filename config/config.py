@@ -368,6 +368,21 @@ class MultimodalConfig:
             "sum" | "weighted" | "gate".
         fusion_lambda: "weighted" 융합의 학습 가능한 λ 초기값 (0~1;
             이미지 기여 비중). 출력 = text + λ*image이며 λ는 항상 학습된다.
+        caption_loss_weight: 캡셔닝 보조 손실의 가중치. 0보다 크면 이미지
+            memory만 보고 타겟 문장을 생성하는 보조 태스크를 함께 학습해
+            이미지 인코더에 직접적인 gradient 신호를 준다
+            (총 손실 = 번역 손실 + w * 캡션 손실). 0이면 완전 비활성화되며
+            캡션 헤드 자체가 생성되지 않는다 (기존 동작과 동일).
+        caption_layers: 캡셔닝 보조 태스크 전용 경량 디코더의 층 수
+            (caption_loss_weight > 0이고 caption_share_decoder=false일 때만 사용).
+        caption_share_decoder: 캡셔닝 보조 태스크가 사용할 디코더 선택.
+            false(기본)면 전용 경량 디코더(models/caption_head.py)를 따로 두어
+            번역 경로를 완전히 격리한다. true면 번역 디코더를 공유하되
+            텍스트 cross-attention만 건너뛰고 이미지는 기존
+            image_cross_attention 경로로 보낸다 — 추론 시 실제로 이미지를
+            소비하는 image cross-attention과 fusion까지 보조 손실로 함께
+            학습되며 파라미터가 늘지 않는다. 대신 캡션 forward가 전체 디코더
+            스택을 통과하므로 계산 비용이 크다.
         freeze_image_encoder: true면 이미지 인코더 파라미터를 동결한다
             (기본은 false — 번역 손실로 함께 학습).
         use_image_cache: true면 매 스텝 JPEG를 디코딩/리사이즈하지 않고,
@@ -390,6 +405,9 @@ class MultimodalConfig:
     image_ffn_dim: int = 1024
     fusion_type: str = "gate"
     fusion_lambda: float = 0.5
+    caption_loss_weight: float = 0.0
+    caption_layers: int = 1
+    caption_share_decoder: bool = False
     freeze_image_encoder: bool = False
     use_image_cache: bool = False
     image_cache_dir: str = "data/image/cache"
@@ -565,6 +583,15 @@ class Config:
                         f"multimodal.image_embed_dim ({mm.image_embed_dim}) must be "
                         f"divisible by image_heads ({mm.image_heads})"
                     )
+            if mm.caption_loss_weight < 0.0:
+                raise ValueError(
+                    f"multimodal.caption_loss_weight must be >= 0, "
+                    f"got {mm.caption_loss_weight}"
+                )
+            if mm.caption_layers < 1:
+                raise ValueError(
+                    f"multimodal.caption_layers must be >= 1, got {mm.caption_layers}"
+                )
             if not 0.0 <= mm.fusion_lambda <= 1.0:
                 raise ValueError(
                     f"multimodal.fusion_lambda must be in [0, 1], got {mm.fusion_lambda}"

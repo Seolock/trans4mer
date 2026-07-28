@@ -124,6 +124,12 @@ multimodal:                      # Multimodal MT (이미지 보강). use_image=f
   image_ffn_dim: 256             # ViT feed-forward 은닉 폭
   fusion_type: sum              # sum | weighted | gate (모두 text + lam*image 형태)
   fusion_lambda: 0.5             # weighted 융합의 학습 가능한 λ 초기값 (image 비중)
+  caption_loss_weight: 0.3       # 캡셔닝 보조 손실 가중치 (0이면 비활성; 이미지 인코더 직접 학습)
+  caption_layers: 1              # 캡션 전용 디코더 층 수 (caption_share_decoder=false일 때만)
+  caption_share_decoder: false   # false -> 전용 경량 디코더(번역 경로 격리)
+                                 # true  -> 번역 디코더 공유(텍스트 cross-attn 스킵).
+                                 #          추론에 쓰이는 image cross-attn/fusion까지
+                                 #          함께 학습되고 파라미터 0 추가, 대신 느림.
   freeze_image_encoder: false    # true -> 이미지 인코더 동결 (기본: 번역 손실로 함께 학습)
   use_image_cache: true         # true -> preprocess_images.py로 만든 uint8 캐시(memmap)에서 로드
   image_cache_dir: data/data-bin/image  # 캐시 .npy 저장 위치 ({split}_{image_size}.npy)

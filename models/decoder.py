@@ -61,21 +61,26 @@ class Decoder(nn.Module):
     def forward(
         self,
         x: Tensor,
-        memory: Tensor,
+        memory: Optional[Tensor] = None,
         tgt_mask: Optional[Tensor] = None,
         memory_mask: Optional[Tensor] = None,
         image_memory: Optional[Tensor] = None,
         image_mask: Optional[Tensor] = None,
+        skip_text_cross_attention: bool = False,
     ) -> Tensor:
         """임베딩된 타겟 prefix 배치를 미리 계산된 인코더 memory에 대해 디코딩한다.
 
         Args:
             x: ``(batch, tgt_len, d_model)`` 임베딩된 타겟 토큰.
             memory: ``(batch, src_len, d_model)`` 텍스트 인코더 출력.
+                ``skip_text_cross_attention=True``면 사용되지 않으므로 None 가능.
             tgt_mask: causal + 타겟-패딩이 결합된 마스크.
             memory_mask: 텍스트 cross-attention을 위한 소스-패딩 마스크.
             image_memory: ``(batch, num_patches, d_model)`` 이미지 인코더 출력 또는 None.
             image_mask: 이미지 cross-attention용 선택적 마스크 또는 None.
+            skip_text_cross_attention: True면 모든 레이어가 텍스트
+                cross-attention을 건너뛰고 이미지 기여만 사용한다 (캡셔닝
+                보조 태스크의 디코더 공유 모드).
 
         Returns:
             ``(batch, tgt_len, d_model)`` 디코더 상태 (프로젝션 전).
@@ -85,7 +90,10 @@ class Decoder(nn.Module):
         # 마스킹된 Self-Attention -> Text(+Image) Cross-Attention -> Fusion ->
         # Feed Forward, residual + LayerNorm 포함).
         for layer in self.layers:
-            x = layer(x, memory, tgt_mask, memory_mask, image_memory, image_mask)
+            x = layer(
+                x, memory, tgt_mask, memory_mask, image_memory, image_mask,
+                skip_text_cross_attention=skip_text_cross_attention,
+            )
 
         # ===================== 2) 최종 LayerNorm (Pre-LN 전용) =====================
         if self.final_norm is not None:

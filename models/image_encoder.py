@@ -24,6 +24,9 @@
       둘 다 scratch 구현이다.
     - freeze_image_encoder=true면 파라미터의 requires_grad를 꺼서 이미지
       인코더를 동결한다 (기본은 false — 번역 손실로 함께 end-to-end 학습).
+    - multimodal.caption_loss_weight > 0이면 번역 손실에 더해 캡셔닝 보조
+      손실(이미지만 보고 타겟 문장 생성; models/caption_head.py)로도
+      학습되어, 이 인코더에 훨씬 직접적인 gradient 신호가 들어온다.
 ===============================================================================
 """
 

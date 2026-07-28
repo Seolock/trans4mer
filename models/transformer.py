@@ -57,6 +57,7 @@ from config.config import Config
 from models.decoder import Decoder
 from models.embedding import TokenEmbedding, TransformerEmbedding
 from models.encoder import Encoder
+from models.caption_head import CaptionHead
 from models.image_encoder import ImageEncoder
 from models.positional_encoding import build_positional_encoding
 from models.utils import combine_masks, init_xavier, make_causal_mask, make_pad_mask
@@ -127,6 +128,16 @@ class Transformer(nn.Module):
         self.use_image = config.multimodal.use_image
         if self.use_image:
             self.image_encoder = ImageEncoder(config)
+
+        # -------------------------------------------------- 캡셔닝 보조 태스크
+        # caption_loss_weight > 0일 때만 활성화된다 (학습 전용).
+        # caption_share_decoder=false: 전용 경량 헤드를 따로 만든다 (번역 경로 격리).
+        # caption_share_decoder=true : 번역 디코더를 공유하므로 새 모듈을 만들지
+        #   않는다 -> 파라미터 0 추가, state_dict가 비활성 시와 동일.
+        self.use_caption_head = self.use_image and config.multimodal.caption_loss_weight > 0.0
+        self.caption_share_decoder = config.multimodal.caption_share_decoder
+        if self.use_caption_head and not self.caption_share_decoder:
+            self.caption_head = CaptionHead(config)
 
         # -------------------------------------------------------- generator
         # d_model에서 어휘집 logits로의 최종 프로젝션. 가중치가 묶여있을
@@ -239,7 +250,13 @@ class Transformer(nn.Module):
         )
 
     # ---------------------------------------------------------------- forward
-    def forward(self, src: Tensor, image: Optional[Tensor], tgt: Tensor) -> Tensor:
+    def forward(
+        self,
+        src: Tensor,
+        image: Optional[Tensor],
+        tgt: Tensor,
+        return_image_memory: bool = False,
+    ) -> Tensor | tuple[Tensor, Optional[Tensor]]:
         """학습과 평가를 위한 teacher-forced forward pass.
 
         마스크 생성부터 어휘집 프로젝션까지 전체 데이터 흐름이 이 함수
@@ -256,9 +273,16 @@ class Transformer(nn.Module):
                 한 칸 민 것, 즉 ``[BOS, y1, ..., y_{n-1}]``. 위치 ``t``는
                 ``y_t``를 예측하므로, 손실은 출력을 ``[y1, ..., y_n(EOS)]``와
                 비교한다 (datasets/collate.py 참고).
+            return_image_memory: True면 ``(logits, image_memory)`` 튜플을
+                반환한다. 학습 루프가 캡셔닝 보조 손실을 계산할 때 이미지를
+                두 번 인코딩하지 않도록 재사용하기 위한 것이다. 기본값
+                False에서는 기존과 동일하게 logits만 반환하므로 추론/평가
+                경로는 영향을 받지 않는다.
 
         Returns:
             ``(batch, tgt_len, vocab_size)`` 정규화되지 않은 logits.
+            ``return_image_memory=True``면 ``(logits, image_memory)`` 튜플
+            (이미지가 없으면 image_memory는 None).
         """
         # ===================== 1) 마스크 생성 =====================
         # 소스 패딩 마스크: (B, 1, 1, src_len), True = 실제 토큰.
@@ -291,4 +315,63 @@ class Transformer(nn.Module):
 
         # ===================== 4) 어휘집 프로젝션 =====================
         # (B, tgt_len, d_model) -> (B, tgt_len, vocab_size)
+        logits = self.generator(decoded)
+        if return_image_memory:
+            # 학습 루프가 캡셔닝 보조 손실에 재사용한다 (이미지 재인코딩 방지).
+            return logits, image_memory
+        return logits
+
+    def caption_logits(self, image_memory: Tensor, tgt: Tensor) -> Tensor:
+        """캡셔닝 보조 태스크의 어휘집 logits을 계산한다 (학습 전용).
+
+        이미지 memory만 보고 타겟 문장(= 그 이미지의 캡션)을 예측하도록
+        하는 보조 경로다. 텍스트 인코더는 어느 모드에서도 관여하지 않는다.
+
+        ``multimodal.caption_share_decoder``가 경로를 결정한다:
+          - false: 전용 경량 헤드(:class:`CaptionHead`)로 디코딩 — gradient는
+            이미지 인코더 + 캡션 헤드 + 공유된 임베딩/generator로 흐른다.
+          - true : 번역 디코더를 공유하되 텍스트 cross-attention을 건너뛴다 —
+            추론 시 실제로 이미지를 소비하는 image cross-attention과 fusion까지
+            gradient를 받는다 (텍스트 cross-attention은 호출되지 않으므로
+            텍스트/이미지 분포가 한 모듈에 섞이지 않는다).
+
+        Args:
+            image_memory: ``(batch, num_patches, d_model)`` 이미지 인코더
+                출력 (:meth:`forward`가 ``return_image_memory=True``로
+                돌려준 값을 재사용).
+            tgt: ``(batch, tgt_len)`` 디코더 입력 id (번역과 동일한
+                teacher-forcing 텐서).
+
+        Returns:
+            ``(batch, tgt_len, vocab_size)`` 캡션 logits.
+
+        Raises:
+            RuntimeError: 캡션 헤드가 생성되지 않은 설정에서 호출된 경우.
+        """
+        if not self.use_caption_head:
+            raise RuntimeError(
+                "caption_logits() requires multimodal.caption_loss_weight > 0 "
+                "(캡션 헤드가 생성되지 않았습니다)."
+            )
+        # 번역과 동일한 causal + 패딩 마스크 (미래 토큰을 보지 못하게).
+        tgt_mask = make_pad_mask(tgt, self.pad_id)
+        if self.mask_future:
+            tgt_mask = combine_masks(tgt_mask, make_causal_mask(tgt.size(1), tgt.device))
+
+        # 타겟 임베딩과 generator는 번역 쪽과 공유한다 — 같은 타겟 언어라
+        # 파라미터가 늘지 않고, 시각 신호가 임베딩/출력층까지 흐른다.
+        tgt_embedded = self.tgt_embedding(tgt)
+        if self.caption_share_decoder:
+            # 번역 디코더 공유: 텍스트 cross-attention만 건너뛰고 이미지는
+            # 기존 image cross-attention 경로로 보낸다 (memory는 쓰이지 않음).
+            decoded = self.decoder(
+                tgt_embedded,
+                memory=None,
+                tgt_mask=tgt_mask,
+                memory_mask=None,
+                image_memory=image_memory,
+                skip_text_cross_attention=True,
+            )
+        else:
+            decoded = self.caption_head(tgt_embedded, image_memory, tgt_mask=tgt_mask)
         return self.generator(decoded)

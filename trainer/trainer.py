@@ -117,6 +117,33 @@ class Trainer:
         self.accumulation_steps = max(1, t.accumulation_steps)
         self.logger = get_logger("trainer", log_file=Path(c.save_dir) / "train.log")
 
+        # ------------------------------------------- 캡셔닝 보조 손실 (이미지 인코더)
+        # 모델이 캡션 헤드를 실제로 만들었을 때만 활성화한다 (use_image이고
+        # caption_loss_weight > 0). 총 손실 = 번역 손실 + w * 캡션 손실.
+        self.caption_weight = (
+            config.multimodal.caption_loss_weight
+            if getattr(model, "use_caption_head", False)
+            else 0.0
+        )
+        if self.caption_weight > 0:
+            if config.multimodal.caption_share_decoder:
+                self.logger.info(
+                    "Caption auxiliary loss enabled (weight=%.3f, mode=shared-decoder) — "
+                    "이미지 인코더 + 번역 디코더의 image cross-attn/fusion이 함께 학습됩니다",
+                    self.caption_weight,
+                )
+            else:
+                self.logger.info(
+                    "Caption auxiliary loss enabled (weight=%.3f, mode=separate-head, "
+                    "layers=%d) — 이미지 인코더가 캡셔닝으로 함께 학습됩니다",
+                    self.caption_weight, config.multimodal.caption_layers,
+                )
+            if config.multimodal.freeze_image_encoder:
+                self.logger.warning(
+                    "freeze_image_encoder=true 이므로 캡션 손실이 이미지 인코더를 "
+                    "학습시키지 못합니다 (캡션 헤드만 학습됨)"
+                )
+
         # ------------------------------------------------ valid BLEU (생성 기반)
         # tgt_vocab이 있고 training.valid_bleu가 켜졌을 때만 매 검증마다 greedy
         # 생성으로 BLEU를 계산한다. 생성 길이는 translator와 동일 규칙.
@@ -217,16 +244,24 @@ class Trainer:
     #  학습 내부 로직                                                        #
     # ====================================================================== #
     def _train_epoch(self, epoch: int) -> float:
-        """학습 데이터를 한 번 순회한다; 토큰당 평균 loss를 반환한다."""
+        """학습 데이터를 한 번 순회한다; 토큰당 평균 (번역) loss를 반환한다.
+
+        캡셔닝 보조 손실이 켜져 있으면 별도 meter로 함께 누적해 로그와
+        TensorBoard에 분리해서 남긴다 (두 손실을 따로 봐야 가중치 튜닝이
+        가능하다).
+        """
         self.model.train()
         meter = AverageMeter()
+        caption_meter = AverageMeter()
         num_batches = len(self.train_loader)
         progress = tqdm(self.train_loader, desc=f"epoch {epoch + 1}", leave=False)
 
         self.optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(progress):
-            loss, num_tokens = self._train_step(batch)
+            loss, caption_loss, num_tokens = self._train_step(batch)
             meter.update(loss, weight=num_tokens)
+            if self.caption_weight > 0:
+                caption_meter.update(caption_loss, weight=num_tokens)
 
             # 누적 경계에서 그리고 마지막 배치에서 스텝하여, 끝에 남는
             # 부분적인 누적 구간에서도 가중치가 업데이트되게 한다.
@@ -234,36 +269,71 @@ class Trainer:
             if is_boundary or (batch_index + 1) == num_batches:
                 self._optimizer_step()
                 if self.global_step % self.config.training.log_every == 0:
-                    self._log_train_step(loss)
+                    self._log_train_step(loss, caption_loss)
 
-            progress.set_postfix(
-                loss=f"{meter.average:.4f}", lr=f"{self._current_lr():.2e}"
+            postfix = {"loss": f"{meter.average:.4f}", "lr": f"{self._current_lr():.2e}"}
+            if self.caption_weight > 0:
+                postfix["cap"] = f"{caption_meter.average:.4f}"
+            progress.set_postfix(**postfix)
+
+        if self.caption_weight > 0:
+            self.logger.info(
+                "epoch %d — train loss %.4f | caption loss %.4f",
+                epoch + 1, meter.average, caption_meter.average,
             )
-
-        self.logger.info("epoch %d — train loss %.4f", epoch + 1, meter.average)
+        else:
+            self.logger.info("epoch %d — train loss %.4f", epoch + 1, meter.average)
         return meter.average
 
-    def _train_step(self, batch: dict[str, torch.Tensor]) -> tuple[float, int]:
+    def _train_step(self, batch: dict[str, torch.Tensor]) -> tuple[float, float, int]:
         """하나의 micro-batch에 대한 forward + backward.
 
+        캡셔닝 보조 손실이 켜져 있으면 이미지 memory만 보고 타겟 문장을
+        예측하는 보조 손실을 함께 계산해 총 손실에 더한다 (이미지 인코더에
+        직접적인 gradient 신호를 주기 위함).
+
         Returns:
-            평균 계산을 위한 ``(스케일 되지 않은 loss 값, 패딩이 아닌 토큰 개수)``.
+            평균 계산을 위한 ``(번역 loss 값, 캡션 loss 값, 패딩이 아닌 토큰
+            개수)``. 캡션 손실이 비활성이면 캡션 loss는 0.0이다.
         """
         batch = move_to_device(batch, self.device)
         targets = batch["tgt_output"]
+        flat_targets = targets.reshape(-1)
+        caption_value = 0.0
 
         with amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
             # batch.get("image"): Multimodal이면 (B, C, H, W) 이미지 텐서,
             # 텍스트-only면 None (모델이 이미지 경로를 건너뛴다).
-            logits = self.model(batch["src"], batch.get("image"), batch["tgt_input"])
-            loss = self.criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            # 캡션 손실이 켜져 있으면 image_memory를 함께 받아 재사용한다
+            # (이미지를 두 번 인코딩하지 않기 위해).
+            if self.caption_weight > 0:
+                logits, image_memory = self.model(
+                    batch["src"], batch.get("image"), batch["tgt_input"],
+                    return_image_memory=True,
+                )
+            else:
+                logits = self.model(batch["src"], batch.get("image"), batch["tgt_input"])
+                image_memory = None
+
+            loss = self.criterion(logits.reshape(-1, logits.size(-1)), flat_targets)
+
+            # 캡셔닝 보조 손실: 이미지 memory만으로 같은 타겟 문장을 예측.
+            if self.caption_weight > 0 and image_memory is not None:
+                caption_logits = self.model.caption_logits(image_memory, batch["tgt_input"])
+                caption_loss = self.criterion(
+                    caption_logits.reshape(-1, caption_logits.size(-1)), flat_targets
+                )
+                caption_value = caption_loss.item()
+                loss = loss + self.caption_weight * caption_loss
 
         # accumulation_steps로 나눠서, micro-batch gradient들의 합이 하나의
         # 큰 배치에 대한 gradient와 같아지도록 한다.
         self.scaler.scale(loss / self.accumulation_steps).backward()
 
         num_tokens = int((targets != self.pad_id).sum().item())
-        return loss.item(), num_tokens
+        # 로깅에는 번역 손실과 캡션 손실을 분리해서 돌려준다 (가중합 이전 값).
+        translation_value = loss.item() - self.caption_weight * caption_value
+        return translation_value, caption_value, num_tokens
 
     def _optimizer_step(self) -> None:
         """gradient를 클리핑, 적용, 초기화한다; 스케줄러와 스텝 카운트를 진행한다."""
@@ -282,11 +352,22 @@ class Trainer:
     def _current_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
 
-    def _log_train_step(self, loss: float) -> None:
-        """스텝별 loss/lr을 train.log에 기록한다 (log_every 주기)."""
-        self.logger.info(
-            "step %d — loss %.4f | lr %.2e", self.global_step, loss, self._current_lr()
-        )
+    def _log_train_step(self, loss: float, caption_loss: float = 0.0) -> None:
+        """스텝별 loss/lr을 train.log에 기록한다 (log_every 주기).
+
+        Args:
+            loss: 번역 손실 (가중합 이전 값).
+            caption_loss: 캡셔닝 보조 손실 (비활성이면 로그에 넣지 않음).
+        """
+        if self.caption_weight > 0:
+            self.logger.info(
+                "step %d — loss %.4f | caption %.4f | lr %.2e",
+                self.global_step, loss, caption_loss, self._current_lr(),
+            )
+        else:
+            self.logger.info(
+                "step %d — loss %.4f | lr %.2e", self.global_step, loss, self._current_lr()
+            )
 
     # ====================================================================== #
     #  검증 & early stopping                                                 #
