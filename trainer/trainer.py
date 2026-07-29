@@ -294,8 +294,6 @@ class Trainer:
             is_boundary = (batch_index + 1) % self.accumulation_steps == 0
             if is_boundary or (batch_index + 1) == num_batches:
                 self._optimizer_step()
-                if self.global_step % self.config.training.log_every == 0:
-                    self._log_train_step(loss, caption_loss)
 
             postfix = {"loss": f"{meter.average:.4f}", "lr": f"{self._current_lr():.2e}"}
             if self.caption_weight > 0:
@@ -377,23 +375,6 @@ class Trainer:
 
     def _current_lr(self) -> float:
         return self.optimizer.param_groups[0]["lr"]
-
-    def _log_train_step(self, loss: float, caption_loss: float = 0.0) -> None:
-        """스텝별 loss/lr을 train.log에 기록한다 (log_every 주기).
-
-        Args:
-            loss: 번역 손실 (가중합 이전 값).
-            caption_loss: 캡셔닝 보조 손실 (비활성이면 로그에 넣지 않음).
-        """
-        if self.caption_weight > 0:
-            self.logger.info(
-                "step %d — loss %.4f | caption %.4f | lr %.2e",
-                self.global_step, loss, caption_loss, self._current_lr(),
-            )
-        else:
-            self.logger.info(
-                "step %d — loss %.4f | lr %.2e", self.global_step, loss, self._current_lr()
-            )
 
     # ====================================================================== #
     #  검증 & early stopping                                                 #

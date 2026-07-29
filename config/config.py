@@ -183,7 +183,6 @@ class TrainingConfig:
         num_workers: DataLoader 워커 프로세스 수.
         save_every: N epoch마다 주기적으로 체크포인트 저장.
         validate_every: N epoch마다 검증(validation) 실행.
-        log_every: N 옵티마이저 스텝마다 train.log에 학습 스칼라 로깅.
         early_stopping_patience: best metric 개선 없이 N번 검증 후 학습
             중단 (0이면 early stopping 비활성화).
         device: 사용할 디바이스 ("cuda" | "cuda:N" | "mps" | "cpu").
@@ -202,7 +201,6 @@ class TrainingConfig:
     num_workers: int = 2
     save_every: int = 1
     validate_every: int = 1
-    log_every: int = 50
     early_stopping_patience: int = 5
     device: Optional[str] = None
     valid_bleu: bool = True
