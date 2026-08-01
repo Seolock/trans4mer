@@ -381,6 +381,18 @@ class MultimodalConfig:
             소비하는 image cross-attention과 fusion까지 보조 손실로 함께
             학습되며 파라미터가 늘지 않는다. 대신 캡션 forward가 전체 디코더
             스택을 통과하므로 계산 비용이 크다.
+        contrastive_loss_weight: 이미지-텍스트 대조 손실(CLIP 방식 대칭
+            InfoNCE)의 가중치. 0보다 크면 배치 안에서 같은 (문장, 이미지)
+            쌍은 가깝게, 다른 쌍끼리는 멀게 만들어 두 인코더 출력을 같은
+            의미 공간으로 정렬한다 (총 손실 = 번역 손실 + w * 대조 손실).
+            0이면 완전 비활성화되며 대조 헤드 자체가 생성되지 않는다.
+            negative 개수가 곧 배치 크기이므로 배치가 클수록 신호가 강하다
+            (gradient 누적은 negative를 늘려주지 않는다).
+        contrastive_dim: 대조 손실을 계산하는 공유 임베딩 공간의 차원
+            (모달리티별 선형 투영 헤드의 출력 폭).
+        contrastive_temperature: 학습 가능한 logit_scale의 **초기값**을
+            정한다 (logit_scale = log(1/T)). 학습 중 자동으로 조정되며
+            exp 후 100으로 clamp된다. CLIP 기본값은 0.07.
         freeze_image_encoder: true면 이미지 인코더 파라미터를 동결한다
             (기본은 false — 번역 손실로 함께 학습).
         use_image_cache: true면 매 스텝 JPEG를 디코딩/리사이즈하지 않고,
@@ -406,6 +418,9 @@ class MultimodalConfig:
     caption_loss_weight: float = 0.0
     caption_layers: int = 1
     caption_share_decoder: bool = False
+    contrastive_loss_weight: float = 0.0
+    contrastive_dim: int = 128
+    contrastive_temperature: float = 0.07
     freeze_image_encoder: bool = False
     use_image_cache: bool = False
     image_cache_dir: str = "data/image/cache"
@@ -593,4 +608,18 @@ class Config:
             if not 0.0 <= mm.fusion_lambda <= 1.0:
                 raise ValueError(
                     f"multimodal.fusion_lambda must be in [0, 1], got {mm.fusion_lambda}"
+                )
+            if mm.contrastive_loss_weight < 0.0:
+                raise ValueError(
+                    f"multimodal.contrastive_loss_weight must be >= 0, "
+                    f"got {mm.contrastive_loss_weight}"
+                )
+            if mm.contrastive_dim < 1:
+                raise ValueError(
+                    f"multimodal.contrastive_dim must be >= 1, got {mm.contrastive_dim}"
+                )
+            if mm.contrastive_temperature <= 0.0:
+                raise ValueError(
+                    f"multimodal.contrastive_temperature must be > 0, "
+                    f"got {mm.contrastive_temperature}"
                 )

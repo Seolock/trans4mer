@@ -30,6 +30,10 @@
       아예 컨텍스트에 진입하지 않는다.
       클리핑 임계값이 실제(진짜) 단위가 되도록 클리핑 전에 gradient의
       스케일을 되돌린다(unscale).
+    - 보조 손실(멀티모달 전용, 학습에만 쓰임): 캡셔닝(이미지만 보고 타겟
+      문장 예측)과 대조(배치 내 이미지-텍스트 정렬). 각각 가중치가 0보다
+      클 때만 활성화되며 총 손실에 가중합으로 더해진다. 로깅용 번역 손실은
+      보조 항을 더하기 전에 붙잡아둔다.
     - 스케줄러는 매 OPTIMIZER 스텝마다 한 번씩 스텝된다; total_steps는
       loader 길이, 누적, epoch로부터 계산된다.
     - Early stopping은 (epoch가 아니라) 연속된 검증 횟수 중 개선이 없는
@@ -168,6 +172,33 @@ class Trainer:
                     "학습시키지 못합니다 (캡션 헤드만 학습됨)"
                 )
 
+        # ------------------------------------------ 이미지-텍스트 대조 손실
+        # 모델이 대조 헤드를 실제로 만들었을 때만 활성화한다 (use_image이고
+        # contrastive_loss_weight > 0). 총 손실 += w * 대조 손실.
+        self.contrastive_weight = (
+            config.multimodal.contrastive_loss_weight
+            if getattr(model, "use_contrastive", False)
+            else 0.0
+        )
+        if self.contrastive_weight > 0:
+            self.logger.info(
+                "Contrastive loss enabled (weight=%.3f, dim=%d, T0=%.3f) — "
+                "배치 내 negative %d개로 이미지/텍스트 인코더 출력을 정렬합니다",
+                self.contrastive_weight, config.multimodal.contrastive_dim,
+                config.multimodal.contrastive_temperature, t.batch_size,
+            )
+            if self.accumulation_steps > 1:
+                self.logger.warning(
+                    "accumulation_steps=%d — 대조 손실의 negative는 micro-batch(%d개)"
+                    " 안에서만 만들어지므로 누적으로 늘어나지 않습니다",
+                    self.accumulation_steps, t.batch_size,
+                )
+            if config.multimodal.freeze_image_encoder:
+                self.logger.warning(
+                    "freeze_image_encoder=true 이므로 대조 손실이 이미지 인코더를 "
+                    "학습시키지 못합니다 (텍스트 쪽과 투영 헤드만 학습됨)"
+                )
+
         # ------------------------------------------------ valid BLEU (생성 기반)
         # tgt_vocab이 있고 training.valid_bleu가 켜졌을 때만 매 검증마다 greedy
         # 생성으로 BLEU를 계산한다. 생성 길이는 translator와 동일 규칙.
@@ -272,22 +303,26 @@ class Trainer:
     def _train_epoch(self, epoch: int) -> float:
         """학습 데이터를 한 번 순회한다; 토큰당 평균 (번역) loss를 반환한다.
 
-        캡셔닝 보조 손실이 켜져 있으면 별도 meter로 함께 누적해 로그와
-        TensorBoard에 분리해서 남긴다 (두 손실을 따로 봐야 가중치 튜닝이
-        가능하다).
+        보조 손실(캡셔닝 / 대조)이 켜져 있으면 각각 별도 meter로 누적해
+        로그에 분리해서 남긴다 — 손실을 따로 봐야 가중치 튜닝이 가능하다.
         """
         self.model.train()
         meter = AverageMeter()
         caption_meter = AverageMeter()
+        contrastive_meter = AverageMeter()
         num_batches = len(self.train_loader)
         progress = tqdm(self.train_loader, desc=f"epoch {epoch + 1}", leave=False)
 
         self.optimizer.zero_grad(set_to_none=True)
         for batch_index, batch in enumerate(progress):
-            loss, caption_loss, num_tokens = self._train_step(batch)
+            loss, caption_loss, contrastive_loss, num_tokens = self._train_step(batch)
             meter.update(loss, weight=num_tokens)
             if self.caption_weight > 0:
                 caption_meter.update(caption_loss, weight=num_tokens)
+            if self.contrastive_weight > 0:
+                # 대조 손실은 토큰당이 아니라 **예제당** 손실이므로 배치 크기로
+                # 가중한다 (num_tokens로 가중하면 범주 오류).
+                contrastive_meter.update(contrastive_loss, weight=batch["src"].size(0))
 
             # 누적 경계에서 그리고 마지막 배치에서 스텝하여, 끝에 남는
             # 부분적인 누적 구간에서도 가중치가 업데이트되게 한다.
@@ -298,48 +333,59 @@ class Trainer:
             postfix = {"loss": f"{meter.average:.4f}", "lr": f"{self._current_lr():.2e}"}
             if self.caption_weight > 0:
                 postfix["cap"] = f"{caption_meter.average:.4f}"
+            if self.contrastive_weight > 0:
+                postfix["ctr"] = f"{contrastive_meter.average:.4f}"
             progress.set_postfix(**postfix)
 
+        # 활성화된 손실만 골라 한 줄로 기록한다 (보조 손실은 가중합 이전 값).
+        parts = [f"train loss {meter.average:.4f}"]
         if self.caption_weight > 0:
-            self.logger.info(
-                "epoch %d — train loss %.4f | caption loss %.4f",
-                epoch + 1, meter.average, caption_meter.average,
-            )
-        else:
-            self.logger.info("epoch %d — train loss %.4f", epoch + 1, meter.average)
+            parts.append(f"caption loss {caption_meter.average:.4f}")
+        if self.contrastive_weight > 0:
+            parts.append(f"contrastive loss {contrastive_meter.average:.4f}")
+        self.logger.info("epoch %d — %s", epoch + 1, " | ".join(parts))
         return meter.average
 
-    def _train_step(self, batch: dict[str, torch.Tensor]) -> tuple[float, float, int]:
+    def _train_step(
+        self, batch: dict[str, torch.Tensor]
+    ) -> tuple[float, float, float, int]:
         """하나의 micro-batch에 대한 forward + backward.
 
-        캡셔닝 보조 손실이 켜져 있으면 이미지 memory만 보고 타겟 문장을
-        예측하는 보조 손실을 함께 계산해 총 손실에 더한다 (이미지 인코더에
-        직접적인 gradient 신호를 주기 위함).
+        보조 손실이 켜져 있으면 함께 계산해 총 손실에 더한다 (둘 다 이미지
+        인코더에 직접적인 gradient 신호를 주기 위함):
+          - 캡셔닝: 이미지 memory만 보고 타겟 문장을 예측.
+          - 대조   : 배치 내 같은 (문장, 이미지) 쌍은 가깝게, 다른 쌍은 멀게.
 
         Returns:
-            평균 계산을 위한 ``(번역 loss 값, 캡션 loss 값, 패딩이 아닌 토큰
-            개수)``. 캡션 손실이 비활성이면 캡션 loss는 0.0이다.
+            평균 계산을 위한 ``(번역 loss 값, 캡션 loss 값, 대조 loss 값,
+            패딩이 아닌 토큰 개수)``. 비활성인 보조 손실 값은 0.0이다.
         """
         batch = move_to_device(batch, self.device)
         targets = batch["tgt_output"]
         flat_targets = targets.reshape(-1)
         caption_value = 0.0
+        contrastive_value = 0.0
+        need_encodings = self.caption_weight > 0 or self.contrastive_weight > 0
 
         with autocast_context(self.amp_enabled):
             # batch.get("image"): Multimodal이면 (B, C, H, W) 이미지 텐서,
             # 텍스트-only면 None (모델이 이미지 경로를 건너뛴다).
-            # 캡션 손실이 켜져 있으면 image_memory를 함께 받아 재사용한다
-            # (이미지를 두 번 인코딩하지 않기 위해).
-            if self.caption_weight > 0:
-                logits, image_memory = self.model(
+            # 보조 손실이 켜져 있으면 인코더 출력을 함께 받아 재사용한다
+            # (인코더를 두 번 돌리지 않기 위해).
+            if need_encodings:
+                logits, memory, image_memory = self.model(
                     batch["src"], batch.get("image"), batch["tgt_input"],
-                    return_image_memory=True,
+                    return_encodings=True,
                 )
             else:
                 logits = self.model(batch["src"], batch.get("image"), batch["tgt_input"])
+                memory = None
                 image_memory = None
 
             loss = self.criterion(logits.reshape(-1, logits.size(-1)), flat_targets)
+            # 보조 항을 더하기 *전에* 붙잡아둔다 — 나중에 뺄셈으로 역산하면
+            # 항이 늘어날 때마다 조용히 어긋난다.
+            translation_value = loss.item()
 
             # 캡셔닝 보조 손실: 이미지 memory만으로 같은 타겟 문장을 예측.
             if self.caption_weight > 0 and image_memory is not None:
@@ -350,14 +396,26 @@ class Trainer:
                 caption_value = caption_loss.item()
                 loss = loss + self.caption_weight * caption_loss
 
+            # 대조 손실: 배치가 곧 negative pool이므로 크기 1이면 항등적으로
+            # 0이라 의미가 없다 (drop_last=False라 마지막 배치가 작을 수 있다).
+            if (
+                self.contrastive_weight > 0
+                and image_memory is not None
+                and memory.size(0) > 1
+            ):
+                contrastive_loss = self.model.contrastive_loss(
+                    memory, batch["src"], image_memory
+                )
+                contrastive_value = contrastive_loss.item()
+                loss = loss + self.contrastive_weight * contrastive_loss
+
         # accumulation_steps로 나눠서, micro-batch gradient들의 합이 하나의
         # 큰 배치에 대한 gradient와 같아지도록 한다.
         self.scaler.scale(loss / self.accumulation_steps).backward()
 
         num_tokens = int((targets != self.pad_id).sum().item())
-        # 로깅에는 번역 손실과 캡션 손실을 분리해서 돌려준다 (가중합 이전 값).
-        translation_value = loss.item() - self.caption_weight * caption_value
-        return translation_value, caption_value, num_tokens
+        # 로깅에는 세 손실을 분리해서 돌려준다 (가중합 이전 값).
+        return translation_value, caption_value, contrastive_value, num_tokens
 
     def _optimizer_step(self) -> None:
         """gradient를 클리핑, 적용, 초기화한다; 스케줄러와 스텝 카운트를 진행한다."""

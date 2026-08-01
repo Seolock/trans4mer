@@ -58,9 +58,16 @@ from models.decoder import Decoder
 from models.embedding import TokenEmbedding, TransformerEmbedding
 from models.encoder import Encoder
 from models.caption_head import CaptionHead
+from models.contrastive import ContrastiveHead
 from models.image_encoder import ImageEncoder
 from models.positional_encoding import build_positional_encoding
-from models.utils import combine_masks, init_xavier, make_causal_mask, make_pad_mask
+from models.utils import (
+    combine_masks,
+    init_xavier,
+    make_causal_mask,
+    make_pad_mask,
+    masked_mean_pool,
+)
 
 
 class Transformer(nn.Module):
@@ -138,6 +145,16 @@ class Transformer(nn.Module):
         self.caption_share_decoder = config.multimodal.caption_share_decoder
         if self.use_caption_head and not self.caption_share_decoder:
             self.caption_head = CaptionHead(config)
+
+        # ------------------------------------------------ 이미지-텍스트 대조 손실
+        # contrastive_loss_weight > 0일 때만 활성화된다 (학습 전용).
+        # init_xavier 이전에 만들어야 투영 행렬이 Xavier 초기화를 받는다
+        # (logit_scale은 0-dim이라 init_xavier가 건드리지 않는다).
+        self.use_contrastive = (
+            self.use_image and config.multimodal.contrastive_loss_weight > 0.0
+        )
+        if self.use_contrastive:
+            self.contrastive_head = ContrastiveHead(config)
 
         # -------------------------------------------------------- generator
         # d_model에서 어휘집 logits로의 최종 프로젝션. 가중치가 묶여있을
@@ -255,8 +272,8 @@ class Transformer(nn.Module):
         src: Tensor,
         image: Optional[Tensor],
         tgt: Tensor,
-        return_image_memory: bool = False,
-    ) -> Tensor | tuple[Tensor, Optional[Tensor]]:
+        return_encodings: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Optional[Tensor]]:
         """학습과 평가를 위한 teacher-forced forward pass.
 
         마스크 생성부터 어휘집 프로젝션까지 전체 데이터 흐름이 이 함수
@@ -273,16 +290,17 @@ class Transformer(nn.Module):
                 한 칸 민 것, 즉 ``[BOS, y1, ..., y_{n-1}]``. 위치 ``t``는
                 ``y_t``를 예측하므로, 손실은 출력을 ``[y1, ..., y_n(EOS)]``와
                 비교한다 (datasets/collate.py 참고).
-            return_image_memory: True면 ``(logits, image_memory)`` 튜플을
-                반환한다. 학습 루프가 캡셔닝 보조 손실을 계산할 때 이미지를
-                두 번 인코딩하지 않도록 재사용하기 위한 것이다. 기본값
-                False에서는 기존과 동일하게 logits만 반환하므로 추론/평가
-                경로는 영향을 받지 않는다.
+            return_encodings: True면 ``(logits, memory, image_memory)``
+                튜플을 반환한다. 학습 루프가 보조 손실(캡셔닝 / 대조)을
+                계산할 때 인코더를 두 번 돌리지 않도록 재사용하기 위한
+                것이다. 기본값 False에서는 기존과 동일하게 logits만
+                반환하므로 추론/평가 경로는 영향을 받지 않는다.
 
         Returns:
             ``(batch, tgt_len, vocab_size)`` 정규화되지 않은 logits.
-            ``return_image_memory=True``면 ``(logits, image_memory)`` 튜플
-            (이미지가 없으면 image_memory는 None).
+            ``return_encodings=True``면 ``(logits, memory, image_memory)``
+            튜플 — ``memory``는 ``(batch, src_len, d_model)`` 텍스트 인코더
+            출력이고, 이미지가 없으면 ``image_memory``는 None이다.
         """
         # ===================== 1) 마스크 생성 =====================
         # 소스 패딩 마스크: (B, 1, 1, src_len), True = 실제 토큰.
@@ -316,9 +334,9 @@ class Transformer(nn.Module):
         # ===================== 4) 어휘집 프로젝션 =====================
         # (B, tgt_len, d_model) -> (B, tgt_len, vocab_size)
         logits = self.generator(decoded)
-        if return_image_memory:
-            # 학습 루프가 캡셔닝 보조 손실에 재사용한다 (이미지 재인코딩 방지).
-            return logits, image_memory
+        if return_encodings:
+            # 학습 루프가 보조 손실(캡셔닝 / 대조)에 재사용한다 (재인코딩 방지).
+            return logits, memory, image_memory
         return logits
 
     def caption_logits(self, image_memory: Tensor, tgt: Tensor) -> Tensor:
@@ -337,7 +355,7 @@ class Transformer(nn.Module):
 
         Args:
             image_memory: ``(batch, num_patches, d_model)`` 이미지 인코더
-                출력 (:meth:`forward`가 ``return_image_memory=True``로
+                출력 (:meth:`forward`가 ``return_encodings=True``로
                 돌려준 값을 재사용).
             tgt: ``(batch, tgt_len)`` 디코더 입력 id (번역과 동일한
                 teacher-forcing 텐서).
@@ -375,3 +393,33 @@ class Transformer(nn.Module):
         else:
             decoded = self.caption_head(tgt_embedded, image_memory, tgt_mask=tgt_mask)
         return self.generator(decoded)
+
+    def contrastive_loss(self, memory: Tensor, src: Tensor, image_memory: Tensor) -> Tensor:
+        """이미지-텍스트 대조 손실을 계산한다 (학습 전용).
+
+        배치 안에서 같은 (문장, 이미지) 쌍은 가깝게, 다른 쌍끼리는 멀게
+        만들어 두 인코더 출력을 같은 의미 공간으로 정렬한다. 풀링을 여기서
+        처리하므로 Trainer는 마스크 규칙을 알 필요가 없다.
+
+        Args:
+            memory: ``(batch, src_len, d_model)`` 텍스트 인코더 출력
+                (:meth:`forward`가 ``return_encodings=True``로 돌려준 값).
+            src: ``(batch, src_len)`` 소스 id — 패딩 위치를 알아내는 데 쓴다.
+            image_memory: ``(batch, num_patches, d_model)`` 이미지 인코더 출력.
+
+        Returns:
+            스칼라 대조 손실.
+
+        Raises:
+            RuntimeError: 대조 헤드가 생성되지 않은 설정에서 호출된 경우.
+        """
+        if not self.use_contrastive:
+            raise RuntimeError(
+                "contrastive_loss() requires multimodal.contrastive_loss_weight > 0 "
+                "(대조 헤드가 생성되지 않았습니다)."
+            )
+        # 인코더 출력에는 패딩 위치가 그대로 남아 있으므로 반드시 마스킹해
+        # 평균한다. 이미지 패치에는 패딩이 없어 마스크가 필요 없다.
+        text_pooled = masked_mean_pool(memory, src != self.pad_id)
+        image_pooled = masked_mean_pool(image_memory)
+        return self.contrastive_head(text_pooled, image_pooled)

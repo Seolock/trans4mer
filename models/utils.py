@@ -17,6 +17,8 @@
     - make_pad_mask   : (batch, seq_len)        -> (batch, 1, 1, seq_len)
     - make_causal_mask: 정수 길이                -> (1, 1, length, length)
     - combine_masks   : 여러 개의 브로드캐스트 가능한 마스크의 논리 AND.
+    - masked_mean_pool: (batch, seq_len, dim)   -> (batch, dim)
+      (같은 True=유효 극성의 (batch, seq_len) 마스크를 받는다)
 
  구현 세부사항:
     마스킹된 위치는 softmax 전에 dtype 최솟값으로 채워진다 (-inf가 아님).
@@ -103,6 +105,28 @@ def combine_masks(*masks: Optional[Tensor]) -> Optional[Tensor]:
             continue
         result = mask if result is None else result & mask
     return result
+
+
+def masked_mean_pool(x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+    """시퀀스 표현을 길이 축으로 평균 내 하나의 벡터로 만든다.
+
+    인코더 출력에는 패딩 위치가 그대로 남아 있다 (마스크는 어텐션만 억제할
+    뿐 출력을 0으로 만들지 않는다). 그래서 단순 ``x.mean(dim=1)``은 패딩
+    자리의 값까지 섞어버린다 — 이 함수는 실제 토큰만 평균한다.
+
+    Args:
+        x: ``(batch, seq_len, dim)`` 풀링할 시퀀스 표현.
+        mask: ``(batch, seq_len)`` 불리언 — True가 실제 토큰 (파일 상단의
+            마스크 규칙과 동일한 극성). None이면 전체 평균 — 이미지 패치처럼
+            패딩이 없는 경우에 쓴다.
+
+    Returns:
+        ``(batch, dim)`` 풀링된 벡터.
+    """
+    if mask is None:
+        return x.mean(dim=1)
+    weights = mask.unsqueeze(-1).to(x.dtype)          # (batch, seq_len, 1)
+    return (x * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
 
 
 def init_xavier(model: nn.Module) -> None:
