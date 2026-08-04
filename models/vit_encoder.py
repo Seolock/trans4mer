@@ -45,6 +45,9 @@ from models.feed_forward import PositionwiseFeedForward
 from models.layer_norm import LayerNorm
 from models.multi_head_attention import MultiHeadAttention
 
+# RGB 고정 — 흑백/다채널 입력은 이 프로젝트의 범위가 아니다.
+IMAGE_CHANNELS = 3
+
 
 class _ViTEncoderLayer(nn.Module):
     """ViT 인코더 블록 하나: (마스크 없는) self-attention + feed-forward, Pre-LN.
@@ -54,21 +57,18 @@ class _ViTEncoderLayer(nn.Module):
     고정 길이(패치 개수)라 어텐션 마스크가 필요 없다.
 
     Args:
-        config: 전체 프로젝트 설정 (multimodal / model / attention 사용).
+        config: 전체 프로젝트 설정 (multimodal / model 사용).
     """
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        mm, m, a = config.multimodal, config.model, config.attention
+        mm, m = config.multimodal, config.model
         self.self_attention = MultiHeadAttention(
             d_model=mm.image_embed_dim,
             n_heads=mm.image_heads,
             attention_dropout=m.attention_dropout,
-            qkv_bias=a.qkv_bias,
-            attention_scaling=a.attention_scaling,
-            attention_type=a.attention_type,
-            causal=False,
-            store_attention=a.store_attention,
+            bias=m.bias,
+            store_attention=m.store_attention,
         )
         self.feed_forward = PositionwiseFeedForward(
             d_model=mm.image_embed_dim,
@@ -77,9 +77,9 @@ class _ViTEncoderLayer(nn.Module):
             activation=m.activation,
             bias=m.bias,
         )
-        self.attention_norm = LayerNorm(mm.image_embed_dim, eps=m.layer_norm_eps, bias=m.bias)
-        self.feed_forward_norm = LayerNorm(mm.image_embed_dim, eps=m.layer_norm_eps, bias=m.bias)
-        self.residual_dropout = nn.Dropout(m.residual_dropout)
+        self.attention_norm = LayerNorm(mm.image_embed_dim, bias=m.bias)
+        self.feed_forward_norm = LayerNorm(mm.image_embed_dim, bias=m.bias)
+        self.residual_dropout = nn.Dropout(m.dropout)
 
     def forward(self, x: Tensor) -> Tensor:
         """Pre-LN self-attention + feed-forward를 실행한다.
@@ -123,7 +123,7 @@ class ViTEncoder(nn.Module):
         # kernel=stride=patch_size인 Conv2d: 겹치지 않는 패치를 잘라 각각을
         # image_embed_dim 벡터로 투영. (B, C, H, W) -> (B, D, H/P, W/P).
         self.patch_embedding = nn.Conv2d(
-            mm.image_channels,
+            IMAGE_CHANNELS,
             mm.image_embed_dim,
             kernel_size=mm.patch_size,
             stride=mm.patch_size,
@@ -135,13 +135,13 @@ class ViTEncoder(nn.Module):
         self.position_embedding = nn.Parameter(
             torch.zeros(1, self.num_patches, mm.image_embed_dim)
         )
-        self.embedding_dropout = nn.Dropout(m.embedding_dropout)
+        self.embedding_dropout = nn.Dropout(m.dropout)
 
         # -------------------------------------------------- Transformer 블록
         self.layers = nn.ModuleList(
             [_ViTEncoderLayer(config) for _ in range(mm.image_layers)]
         )
-        self.final_norm = LayerNorm(mm.image_embed_dim, eps=m.layer_norm_eps, bias=m.bias)
+        self.final_norm = LayerNorm(mm.image_embed_dim, bias=m.bias)
 
         # -------------------------------------------------- d_model로 투영
         # Image Cross-Attention은 디코더와 같은 폭(d_model)을 요구한다.

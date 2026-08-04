@@ -28,24 +28,18 @@
       (B, n_heads, L, d_head). 모든 헤드가 한 번의 matmul로 계산된다.
     - 마스킹된 위치는 dtype 최솟값을 채운다 (AMP에서도 안전; 한 행이
       전부 마스킹되어도 NaN 대신 균등 분포로 softmax된다).
-    - `attention_scaling`은 True(1/sqrt(d_head)), False(스케일링 없음)
-      또는 float(사용자 지정 스케일)이 될 수 있으며 설정으로 제어된다.
-    - `causal=True`면 모듈이 스스로 subsequent 마스크를 만들어서, 이
-      블록들을 디코더 전용 언어 모델에서 재사용할 수 있게 해준다.
-    - 새 어텐션 메커니즘은 서브클래스를 만들고 ATTENTION_REGISTRY에
-      등록하는 방식으로 추가한다; 설정의 `attention_type`이 어떤 항목을
-      쓸지 선택한다.
+    - 점수 스케일은 항상 표준 ``1/sqrt(d_head)``다.
+    - causal 마스킹은 이 모듈이 아니라 호출자(models/transformer.py)가
+      명시적인 마스크로 넘긴다 — 마스크가 어디서 오는지 한 곳만 보면 된다.
 ===============================================================================
 """
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Optional
 
 import torch
 from torch import Tensor, nn
-
-from models.utils import combine_masks, make_causal_mask
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -103,16 +97,8 @@ class ScaledDotProductAttention(nn.Module):
         return context, attention
 
 
-# 설정의 `attention.attention_type`을 구현체에 매핑하는 레지스트리.
-# 예를 들어 linear나 local attention을 추가하려면 (dropout, scale)과
-# 같은 생성자를 가진 클래스를 만들고 여기에 등록하면 된다.
-ATTENTION_REGISTRY: dict[str, type[nn.Module]] = {
-    "scaled_dot_product": ScaledDotProductAttention,
-}
-
-
 class MultiHeadAttention(nn.Module):
-    """프로젝션, 스케일링, 마스킹을 설정으로 제어할 수 있는 multi-head attention.
+    """multi-head attention.
 
     ``d_model``을 ``n_heads``개의 독립적인 부분공간으로 나누고, 각각에서
     어텐션을 수행한 뒤 결과를 이어 붙여 프로젝션한다. 여러 헤드 덕분에
@@ -122,12 +108,7 @@ class MultiHeadAttention(nn.Module):
         d_model: 모델 폭 (``n_heads``로 나눠떨어져야 함).
         n_heads: 어텐션 헤드 개수.
         attention_dropout: 어텐션 확률 맵에 적용하는 dropout.
-        qkv_bias: Q/K/V 및 출력 프로젝션의 bias 항.
-        attention_scaling: True -> ``1/sqrt(d_head)``; False -> 1.0;
-            float -> 해당 사용자 지정 값.
-        attention_type: :data:`ATTENTION_REGISTRY`의 키.
-        causal: True면 모듈 스스로 causal 마스킹을 강제한다
-            (:meth:`forward`에 전달된 마스크와 결합됨).
+        bias: Q/K/V 및 출력 프로젝션의 bias 항.
         store_attention: True면 마지막(detach된) 어텐션 맵을
             ``self.last_attention``에 저장한다 (시각화/디버깅용).
     """
@@ -137,10 +118,7 @@ class MultiHeadAttention(nn.Module):
         d_model: int,
         n_heads: int,
         attention_dropout: float = 0.0,
-        qkv_bias: bool = True,
-        attention_scaling: Union[bool, float] = True,
-        attention_type: str = "scaled_dot_product",
-        causal: bool = False,
+        bias: bool = True,
         store_attention: bool = False,
     ) -> None:
         super().__init__()
@@ -148,31 +126,20 @@ class MultiHeadAttention(nn.Module):
             raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.causal = causal
         self.store_attention = store_attention
         self.last_attention: Optional[Tensor] = None
 
-        # (bool | float) 설정 값으로부터 점수 스케일을 결정한다.
-        if isinstance(attention_scaling, bool):
-            scale = self.d_head**-0.5 if attention_scaling else 1.0
-        else:
-            scale = float(attention_scaling)
-
-        if attention_type not in ATTENTION_REGISTRY:
-            raise ValueError(
-                f"Unknown attention_type '{attention_type}'. "
-                f"Available: {sorted(ATTENTION_REGISTRY)}"
-            )
-        self.attention = ATTENTION_REGISTRY[attention_type](
-            dropout=attention_dropout, scale=scale
+        # 표준 스케일: 1/sqrt(d_head).
+        self.attention = ScaledDotProductAttention(
+            dropout=attention_dropout, scale=self.d_head**-0.5
         )
 
         # Q/K/V를 별도로 프로젝션 (하나의 합쳐진 행렬보다 명확하며,
         # 어차피 cross-attention은 Q와 K/V에 서로 다른 입력이 필요함).
-        self.w_q = nn.Linear(d_model, d_model, bias=qkv_bias)
-        self.w_k = nn.Linear(d_model, d_model, bias=qkv_bias)
-        self.w_v = nn.Linear(d_model, d_model, bias=qkv_bias)
-        self.w_o = nn.Linear(d_model, d_model, bias=qkv_bias)
+        self.w_q = nn.Linear(d_model, d_model, bias=bias)
+        self.w_k = nn.Linear(d_model, d_model, bias=bias)
+        self.w_v = nn.Linear(d_model, d_model, bias=bias)
+        self.w_o = nn.Linear(d_model, d_model, bias=bias)
 
     def forward(
         self,
@@ -210,17 +177,7 @@ class MultiHeadAttention(nn.Module):
         k = k.view(batch_size, key_len, self.n_heads, self.d_head).transpose(1, 2)
         v = v.view(batch_size, key_len, self.n_heads, self.d_head).transpose(1, 2)
 
-        # ===================== 3) Causal 마스크 (옵션) =====================
-        # 모듈 내부에서 선택적으로 causal 제약을 강제한다. 마스크는
-        # 오른쪽 정렬(key_len - query_len만큼 오프셋)되어 있어서,
-        # query_len < key_len인 증분(incremental) 디코딩에서도 계속
-        # 올바르게 동작한다.
-        if self.causal:
-            offset = key_len - query_len
-            causal = make_causal_mask(key_len, query.device)[:, :, offset:, :]
-            mask = combine_masks(mask, causal)
-
-        # ===================== 4) Scaled Dot-Product Attention =====================
+        # ===================== 3) Scaled Dot-Product Attention =====================
         # 모든 헤드에서 한 번에 어텐션을 계산.
         # context: (B, n_heads, Lq, d_head), attention: (B, n_heads, Lq, Lk)
         context, attention = self.attention(q, k, v, mask)
@@ -229,7 +186,7 @@ class MultiHeadAttention(nn.Module):
             # detach해서 시각화가 autograd 그래프를 붙잡고 있지 않도록 한다.
             self.last_attention = attention.detach()
 
-        # ===================== 5) 헤드 결합 =====================
+        # ===================== 4) 헤드 결합 =====================
         # (B, n_heads, Lq, d_head) -> (B, Lq, n_heads, d_head) -> (B, Lq, d_model)
         # transpose 이후 view()를 하려면 contiguous()가 필요하다.
         context = (
@@ -238,5 +195,5 @@ class MultiHeadAttention(nn.Module):
             .view(batch_size, query_len, self.n_heads * self.d_head)
         )
 
-        # ===================== 6) 출력 프로젝션 =====================
+        # ===================== 5) 출력 프로젝션 =====================
         return self.w_o(context)

@@ -25,7 +25,7 @@
     split = train, val, test2016, test2017, testcoco, test2018
 
  입력 / 출력:
-    입력 : config/default.yaml (dataset.raw_dir / bin_dir / lang_pairs /
+    입력 : config/default.yaml (dataset.raw_dir / bin_dir / src_lang / tgt_lang /
            lowercase, bpe.num_merges / vocab_size / min_freq) + 원본 파일.
     출력 : 위 산출물 파일들 + 콘솔 통계.
 
@@ -280,7 +280,7 @@ def preprocess_pair(config: Config, src_lang: str, tgt_lang: str, force: bool) -
     """
     out_dir = pair_dir(config.dataset.bin_dir, src_lang, tgt_lang)
     out_dir.mkdir(parents=True, exist_ok=True)
-    codes_file = codes_path(out_dir, config.bpe.codes_filename)
+    codes_file = codes_path(out_dir)
 
     # 1) BPE merge 규칙 학습 (train.src + train.tgt 공동)
     learn_bpe_codes(config, src_lang, tgt_lang, codes_file, force)
@@ -302,6 +302,10 @@ def main() -> None:
         help="config overrides (repeatable), e.g. --set bpe.num_merges=8000",
     )
     parser.add_argument("--force", action="store_true", help="regenerate all artifacts")
+    parser.add_argument(
+        "--lang-pairs", nargs="+", default=None, metavar="SRC-TGT",
+        help="language pairs to preprocess (default: the active dataset.src_lang-tgt_lang)",
+    )
     args = parser.parse_args()
 
     config = Config.from_yaml(args.config, overrides=args.set)
@@ -310,9 +314,16 @@ def main() -> None:
         logger.error("raw_dir does not exist: %s", raw_dir)
         sys.exit(1)
 
+    # 기본은 활성 쌍 하나만; 여러 쌍을 한 번에 만들려면 --lang-pairs로 넘긴다.
+    pairs = args.lang_pairs or [f"{config.dataset.src_lang}-{config.dataset.tgt_lang}"]
+    for pair in pairs:
+        if len(pair.split("-")) != 2 or not all(pair.split("-")):
+            logger.error("--lang-pairs entry '%s' must look like 'en-de'", pair)
+            sys.exit(1)
+
     summary: list[str] = []
     try:
-        for pair in config.dataset.lang_pairs:
+        for pair in pairs:
             src_lang, tgt_lang = pair.split("-")
             logger.info("=== Preprocessing pair %s-%s ===", src_lang, tgt_lang)
             vocabs = preprocess_pair(config, src_lang, tgt_lang, args.force)

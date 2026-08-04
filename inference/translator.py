@@ -112,7 +112,9 @@ class Translator:
         from subword_nmt.apply_bpe import BPE  # 지연 임포트
 
         state = CheckpointManager.load(checkpoint_path, map_location="cpu")
-        config = Config.from_dict(state["config"])
+        # strict=False: 예전 버전에서 저장된 체크포인트에는 그 사이 제거된
+        # 하이퍼파라미터가 남아 있을 수 있다 (기계가 쓴 값이라 오타는 아니다).
+        config = Config.from_dict(state["config"], strict=False)
         if config_override is not None:
             # 디코딩과 데이터 옵션은 조정될 수 있지만 아키텍처는 안 된다.
             config.inference = config_override.inference
@@ -128,7 +130,7 @@ class Translator:
         base_dir = pair_dir(d.bin_dir, d.src_lang, d.tgt_lang)
         src_vocab = Vocab.load(vocab_path(base_dir, d.src_lang))
         tgt_vocab = Vocab.load(vocab_path(base_dir, d.tgt_lang))
-        codes_file = codes_path(base_dir, config.bpe.codes_filename)
+        codes_file = codes_path(base_dir)
         if not codes_file.exists():
             raise FileNotFoundError(
                 f"BPE codes not found: {codes_file} — run `python preprocess.py` first."

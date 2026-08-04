@@ -76,7 +76,7 @@ class CaptionHead(nn.Module):
         )
         # Pre-LN 스택은 마지막에 한 번 정규화한다 (models/decoder.py와 동일).
         self.final_norm: Optional[LayerNorm] = (
-            LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
+            LayerNorm(m.d_model, bias=m.bias)
             if m.norm_style == "pre"
             else None
         )

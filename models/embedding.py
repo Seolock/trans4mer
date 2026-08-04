@@ -10,9 +10,8 @@
       sqrt(d_model)만큼 스케일링 가능 (임베딩 크기를 sinusoidal 위치
       특징과 비슷한 스케일로 맞춰줌).
     - `TransformerEmbedding`: 인코더 입력과 디코더 입력에 적용되는 전체
-      파이프라인. 두 인스턴스가 하나의 `TokenEmbedding`을 공유해서
-      `share_embedding`을 구현할 수 있으며, 이 밑바탕 가중치 행렬이
-      바로 출력 프로젝션과 묶이는(tie) 대상이다.
+      파이프라인. 밑바탕 `TokenEmbedding`의 가중치 행렬이 바로 출력
+      프로젝션과 묶이는(tie) 대상이다.
 
  입력 / 출력:
     입력 : (batch, seq_len) int64 토큰 id.
@@ -91,9 +90,8 @@ class TokenEmbedding(nn.Module):
 class TransformerEmbedding(nn.Module):
     """완전한 입력 레이어: 토큰 임베딩 + positional encoding + dropout.
 
-    토큰-임베딩 모듈은 (여기서 직접 생성하지 않고) 주입받는 방식이라서,
-    `share_embedding`이 켜졌을 때 인코더와 디코더가 하나의 테이블을 공유할
-    수 있다.
+    토큰-임베딩 모듈은 (여기서 직접 생성하지 않고) 주입받는 방식이라,
+    호출자가 테이블 공유 여부를 결정할 수 있다.
 
     Args:
         token_embedding: (공유될 수도 있는) :class:`TokenEmbedding`.

@@ -3,15 +3,13 @@
  파일: inference/predict.py
  목적:
     최종 사용자를 위한 추론: 체크포인트 + 토크나이저를 로드하고 greedy
-    디코딩, 샘플링(temperature / top-k / top-p / repetition penalty) 또는
-    빔 서치를 통해 텍스트를 번역/변환한다.
+    디코딩 또는 빔 서치를 통해 텍스트를 번역/변환한다.
 
  역할:
     `Predictor`는 test.py와 아래 CLI가 사용하는 단일 진입점이다. 전략
     선택은 추론 설정을 따른다:
-        beam_size > 1                  -> 빔 서치 (inference/beam_search.py)
-        beam_size == 1, do_sample 꺼짐 -> 순수 greedy (argmax)
-        beam_size == 1, do_sample 켜짐 -> 필터링된 샘플링
+        beam_size > 1  -> 빔 서치 (inference/beam_search.py)
+        beam_size == 1 -> greedy (argmax)
 
  입력 / 출력:
     predict(text: str) -> str   (문장 하나 입력, 문장 하나 출력)
@@ -22,11 +20,8 @@
  구현 세부사항:
     - 모델은 체크포인트에 *내장된* 설정 dict로부터 재구성되므로, 아키텍처
       플래그가 학습된 가중치와 절대 어긋날 수 없다.
-    - greedy/샘플링 루프는 매 스텝마다 전체 prefix를 다시 디코딩한다
+    - greedy 루프는 매 스텝마다 전체 prefix를 다시 디코딩한다
       (KV 캐시 없음 — 명확성을 우선함; 최적화 경로는 README 참고).
-    - repetition penalty는 CTRL(Keskar et al., 2019)을 따른다: 이미
-      생성된 토큰의 양수 logit은 penalty로 나누고, 음수는 곱한다.
-      top-k와 top-p 필터는 softmax 전에 logit을 -inf로 마스킹한다.
     - 생성 길이는 inference.max_length와 positional encoding의
       model.max_seq_length 둘 다에 의해 상한이 걸린다.
 ===============================================================================
@@ -46,52 +41,6 @@ from inference.beam_search import BeamSearchDecoder
 from models.transformer import Transformer
 from trainer.checkpoint import CheckpointManager
 from utils.misc import get_device
-
-
-def apply_repetition_penalty(logits: Tensor, generated: Tensor, penalty: float) -> Tensor:
-    """이미 생성된 prefix에 등장하는 토큰들을 억제한다.
-
-    Args:
-        logits: ``(batch, vocab)`` 다음 토큰 logits (제자리에서 수정되지 않음).
-        generated: ``(batch, prefix_len)`` 지금까지 생성된 토큰들.
-        penalty: 1.0보다 큰 값은 반복에 불이익을 준다; 1.0이면 아무 효과 없음.
-
-    Returns:
-        조정된 logits.
-    """
-    if penalty == 1.0:
-        return logits
-    logits = logits.clone()
-    for row in range(logits.size(0)):
-        seen = generated[row].unique()
-        row_logits = logits[row, seen]
-        # CTRL 규칙: 음수 logit을 나누면 오히려 확률이 *올라가므로*,
-        # 음수는 곱하는 방식으로 처리한다.
-        logits[row, seen] = torch.where(
-            row_logits > 0, row_logits / penalty, row_logits * penalty
-        )
-    return logits
-
-
-def filter_top_k(logits: Tensor, top_k: int) -> Tensor:
-    """행마다 가장 높은 ``top_k``개의 logit만 유지한다 (0이면 비활성화)."""
-    if top_k <= 0 or top_k >= logits.size(-1):
-        return logits
-    threshold = torch.topk(logits, top_k, dim=-1).values[..., -1, None]
-    return logits.masked_fill(logits < threshold, float("-inf"))
-
-
-def filter_top_p(logits: Tensor, top_p: float) -> Tensor:
-    """Nucleus 필터링: 누적 확률이 ``top_p``를 넘는 가장 작은 토큰 집합만
-    남긴다 (1.0이면 비활성화)."""
-    if top_p >= 1.0:
-        return logits
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-    cumulative = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-    # 오른쪽으로 시프트해서 임계값을 처음 넘는 토큰도 유지되도록 한다.
-    remove = cumulative - torch.softmax(sorted_logits, dim=-1) > top_p
-    remove_original = remove.scatter(dim=-1, index=sorted_indices, src=remove)
-    return logits.masked_fill(remove_original, float("-inf"))
 
 
 class Predictor:
@@ -142,7 +91,9 @@ class Predictor:
         """
         device = device or get_device()
         state = CheckpointManager.load(checkpoint_path, map_location=device)
-        config = Config.from_dict(state["config"])
+        # strict=False: 예전 버전에서 저장된 체크포인트에는 그 사이 제거된
+        # 하이퍼파라미터가 남아 있을 수 있다 (기계가 쓴 값이라 오타는 아니다).
+        config = Config.from_dict(state["config"], strict=False)
         if config_override is not None:
             # 디코딩과 데이터 옵션은 조정될 수 있지만 아키텍처는 안 된다.
             config.inference = config_override.inference
@@ -155,7 +106,7 @@ class Predictor:
     # -------------------------------------------------------------- 디코딩
     @torch.no_grad()
     def greedy_search(self, src: Tensor) -> list[list[int]]:
-        """greedy / 샘플링 디코딩 (전략은 ``do_sample``에 따라 결정됨).
+        """greedy 디코딩 (매 스텝 argmax).
 
         Args:
             src: ``(batch, src_len)`` 오른쪽 패딩된 소스 id.
@@ -177,18 +128,10 @@ class Predictor:
             decoded = self.model.decode(sequences, memory, memory_mask=src_mask)
             logits = self.model.generator(decoded[:, -1, :]).float()
 
-            logits = apply_repetition_penalty(logits, sequences, inf.repetition_penalty)
             if step <= inf.min_length:
                 logits[:, eos] = float("-inf")  # 최소 길이를 강제한다
 
-            if inf.do_sample:
-                # temperature -> top-k -> top-p -> 샘플링
-                logits = logits / max(inf.temperature, 1e-6)
-                logits = filter_top_p(filter_top_k(logits, inf.top_k), inf.top_p)
-                probabilities = torch.softmax(logits, dim=-1)
-                next_token = torch.multinomial(probabilities, num_samples=1).squeeze(1)
-            else:
-                next_token = logits.argmax(dim=-1)
+            next_token = logits.argmax(dim=-1)
 
             # 완료된 행은 형태를 직사각형으로 유지하기 위해 계속 패딩을 낸다.
             next_token = torch.where(alive, next_token, torch.full_like(next_token, pad))

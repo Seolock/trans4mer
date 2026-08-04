@@ -19,7 +19,7 @@
 
  입력 / 출력:
     입력 : config/default.yaml (multimodal.image_dir / image_size /
-           image_channels / image_cache_dir) + data/image/{split}.txt + 원본 jpg.
+           image_cache_dir) + data/image/{split}.txt + 원본 jpg.
     출력 : {image_cache_dir}/{split}_{image_size}.npy  + 콘솔 통계.
 
  구현 세부사항:
@@ -45,6 +45,7 @@ from torchvision.io import ImageReadMode, read_image
 from tqdm import tqdm
 
 from config.config import Config
+from models.vit_encoder import IMAGE_CHANNELS
 from utils.image import build_resize_transform, resolve_image_path
 from utils.logger import get_logger
 
@@ -149,7 +150,7 @@ def main() -> None:
 
     logger.info(
         "Caching images: size=%d, channels=%d, dir=%s -> %s",
-        mm.image_size, mm.image_channels, mm.image_dir, mm.image_cache_dir,
+        mm.image_size, IMAGE_CHANNELS, mm.image_dir, mm.image_cache_dir,
     )
 
     built = 0
@@ -159,7 +160,7 @@ def main() -> None:
             image_dir=mm.image_dir,
             cache_dir=mm.image_cache_dir,
             image_size=mm.image_size,
-            channels=mm.image_channels,
+            channels=IMAGE_CHANNELS,
             force=args.force,
         ):
             built += 1

@@ -54,18 +54,15 @@ class EncoderLayer(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        m, a = config.model, config.attention
+        m = config.model
         self.norm_first = m.norm_style == "pre"
 
         self.self_attention = MultiHeadAttention(
             d_model=m.d_model,
             n_heads=m.n_heads,
             attention_dropout=m.attention_dropout,
-            qkv_bias=a.qkv_bias,
-            attention_scaling=a.attention_scaling,
-            attention_type=a.attention_type,
-            causal=a.causal,
-            store_attention=a.store_attention,
+            bias=m.bias,
+            store_attention=m.store_attention,
         )
         self.feed_forward = PositionwiseFeedForward(
             d_model=m.d_model,
@@ -74,9 +71,9 @@ class EncoderLayer(nn.Module):
             activation=m.activation,
             bias=m.bias,
         )
-        self.attention_norm = LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
-        self.feed_forward_norm = LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
-        self.residual_dropout = nn.Dropout(m.residual_dropout)
+        self.attention_norm = LayerNorm(m.d_model, bias=m.bias)
+        self.feed_forward_norm = LayerNorm(m.d_model, bias=m.bias)
+        self.residual_dropout = nn.Dropout(m.dropout)
 
     def forward(self, x: Tensor, src_mask: Optional[Tensor] = None) -> Tensor:
         """설정된 정규화 배치에 따라 두 서브레이어를 실행한다.

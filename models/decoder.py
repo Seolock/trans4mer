@@ -53,7 +53,7 @@ class Decoder(nn.Module):
             [DecoderLayer(config) for _ in range(m.num_decoder_layers)]
         )
         self.final_norm: Optional[LayerNorm] = (
-            LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
+            LayerNorm(m.d_model, bias=m.bias)
             if m.norm_style == "pre"
             else None
         )

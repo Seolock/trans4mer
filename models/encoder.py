@@ -53,7 +53,7 @@ class Encoder(nn.Module):
         )
         # Pre-LN에서만 최종 norm을 둔다 (이유는 파일 상단 설명 참고).
         self.final_norm: Optional[LayerNorm] = (
-            LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
+            LayerNorm(m.d_model, bias=m.bias)
             if m.norm_style == "pre"
             else None
         )

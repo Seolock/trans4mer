@@ -33,12 +33,9 @@
     - forward()에는 마스크 생성 -> 인코더 -> 디코더 -> 프로젝션의 전체
       데이터 흐름이 helper 없이 직접 작성되어 있다; encode()/decode()는
       추론(빔 서치 / greedy)이 두 절반을 따로 실행하기 위한 공개 API다.
-    - 가중치 공유 (fairseq 스타일 시맨틱):
-        share_embedding         -> 인코더와 디코더가 하나의 토큰 테이블 공유
-        share_decoder_embedding -> 디코더 입력 임베딩을 출력 프로젝션과
-                                   묶음 (tie_output_projection을 함의)
-        tie_output_projection   -> generator.weight가 디코더 임베딩
-                                   가중치와 *같은* Parameter 객체가 됨
+    - 가중치 공유 (fairseq 스타일 시맨틱): share_decoder_embedding이 켜지면
+      generator.weight가 디코더 임베딩 가중치와 *같은* Parameter 객체가 된다.
+      소스/타겟은 언어별 분리 어휘집이라 임베딩을 공유하지 않는다.
     - Xavier 초기화가 모든 행렬에 걸쳐 실행된 뒤, 텍스트 토큰 임베딩만
       fairseq 방식(normal(0, d_model^-0.5))으로 다시 초기화하고 패딩 행을
       0으로 만든다 (그렇지 않으면 Xavier가 패딩 토큰에도 신호를 줄 것임).
@@ -85,44 +82,31 @@ class Transformer(nn.Module):
         self.config = config
         m = config.model
         self.pad_id = m.pad_token_id
-        # 디코더 self-attention은 명시적으로 비활성화하지 않는 한 causal이다.
-        self.mask_future = config.attention.mask_future or config.attention.causal
 
         # ------------------------------------------------------- 임베딩
-        # 레거시 `learned_position_embedding` 플래그가 타입을 override한다.
-        pe_type = "learned" if m.learned_position_embedding else m.positional_encoding_type
+        pe_type = m.positional_encoding_type
 
         # 언어별 분리 어휘집 지원: src/tgt 크기가 따로 설정되지 않으면
         # 공용 vocab_size를 사용한다 (기존 동작과 동일).
         src_vocab_size = m.src_vocab_size if m.src_vocab_size is not None else m.vocab_size
         tgt_vocab_size = m.tgt_vocab_size if m.tgt_vocab_size is not None else m.vocab_size
 
+        # 언어별로 어휘집이 분리되어 있으므로 소스/타겟 임베딩은 항상 별도다.
         src_token_embedding = TokenEmbedding(
             src_vocab_size, m.d_model, pad_id=self.pad_id, scale=m.scale_embedding
         )
-        # `share_embedding`: 두 번째 테이블을 만드는 대신 디코더 측에서도
-        # *같은* 모듈(즉 같은 가중치)을 재사용한다. 어휘집 크기가 다르면
-        # 공유가 불가능하다.
-        if m.share_embedding:
-            if src_vocab_size != tgt_vocab_size:
-                raise ValueError(
-                    "share_embedding=true requires equal src/tgt vocab sizes "
-                    f"(got {src_vocab_size} vs {tgt_vocab_size})"
-                )
-            tgt_token_embedding = src_token_embedding
-        else:
-            tgt_token_embedding = TokenEmbedding(
-                tgt_vocab_size, m.d_model, pad_id=self.pad_id, scale=m.scale_embedding
-            )
+        tgt_token_embedding = TokenEmbedding(
+            tgt_vocab_size, m.d_model, pad_id=self.pad_id, scale=m.scale_embedding
+        )
         self.src_embedding = TransformerEmbedding(
             src_token_embedding,
             build_positional_encoding(pe_type, m.d_model, m.max_seq_length),
-            dropout=m.embedding_dropout,
+            dropout=m.dropout,
         )
         self.tgt_embedding = TransformerEmbedding(
             tgt_token_embedding,
             build_positional_encoding(pe_type, m.d_model, m.max_seq_length),
-            dropout=m.embedding_dropout,
+            dropout=m.dropout,
         )
 
         # ------------------------------------------------------------ 스택
@@ -161,7 +145,7 @@ class Transformer(nn.Module):
         # 때는 그 가중치가 말 그대로 디코더 임베딩 행렬이므로(bias는
         # 꺼야 함), 그래야 이 매핑이 임베딩 조회의 정확한 전치가 유지된다.
         # 출력 차원은 항상 타겟 어휘집 크기다.
-        tie_generator = m.tie_output_projection or m.share_decoder_embedding
+        tie_generator = m.share_decoder_embedding
         self.generator = nn.Linear(m.d_model, tgt_vocab_size, bias=m.bias and not tie_generator)
 
         # ---------------------------------------------------------- 초기화
@@ -198,8 +182,6 @@ class Transformer(nn.Module):
             불리언 마스크 ``(batch, 1, tgt_len, tgt_len)``.
         """
         pad_mask = make_pad_mask(tgt, self.pad_id)
-        if not self.mask_future:
-            return pad_mask
         causal = make_causal_mask(tgt.size(1), tgt.device)
         return combine_masks(pad_mask, causal)
 
@@ -305,11 +287,9 @@ class Transformer(nn.Module):
         # ===================== 1) 마스크 생성 =====================
         # 소스 패딩 마스크: (B, 1, 1, src_len), True = 실제 토큰.
         src_mask = make_pad_mask(src, self.pad_id)
-        # 타겟 마스크: 패딩 마스크에 (설정 시) causal 마스크를 AND로 결합
+        # 타겟 마스크: 패딩 마스크에 causal 마스크를 AND로 결합
         # -> (B, 1, tgt_len, tgt_len). 미래 위치를 미리 엿보지 못하게 한다.
-        tgt_mask = make_pad_mask(tgt, self.pad_id)
-        if self.mask_future:
-            tgt_mask = combine_masks(tgt_mask, make_causal_mask(tgt.size(1), tgt.device))
+        tgt_mask = self.make_target_mask(tgt)
 
         # ===================== 2) 인코더 =====================
         # 소스 임베딩(토큰 + 위치 + dropout) -> 인코더 스택 -> memory.
@@ -372,9 +352,7 @@ class Transformer(nn.Module):
                 "(캡션 헤드가 생성되지 않았습니다)."
             )
         # 번역과 동일한 causal + 패딩 마스크 (미래 토큰을 보지 못하게).
-        tgt_mask = make_pad_mask(tgt, self.pad_id)
-        if self.mask_future:
-            tgt_mask = combine_masks(tgt_mask, make_causal_mask(tgt.size(1), tgt.device))
+        tgt_mask = self.make_target_mask(tgt)
 
         # 타겟 임베딩과 generator는 번역 쪽과 공유한다 — 같은 타겟 언어라
         # 파라미터가 늘지 않고, 시각 신호가 임베딩/출력층까지 흐른다.

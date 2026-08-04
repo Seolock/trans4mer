@@ -16,7 +16,7 @@
 
  역할:
     디코더 스택에서 반복되는 단위. self-attention은 각 타겟 위치가 이전
-    타겟 위치들만 참고하게 한다(mask_future). Text Cross-Attention은 소스
+    타겟 위치들만 참고하게 한다(causal 마스크). Text Cross-Attention은 소스
     문장 정보가, Image Cross-Attention은 이미지 정보가 디코더로 들어오는
     지점이다 (두 어텐션 모두 쿼리는 디코더 hidden state, 키/값은 각각
     텍스트 memory / 이미지 memory에서 온다). Fusion이 둘을 하나의 표현으로
@@ -72,29 +72,23 @@ class DecoderLayer(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        m, a, mm = config.model, config.attention, config.multimodal
+        m, mm = config.model, config.multimodal
         self.norm_first = m.norm_style == "pre"
         self.use_image = mm.use_image
 
-        def build_attention(causal: bool) -> MultiHeadAttention:
-            """어텐션 모듈들은 causal 여부를 제외한 모든 설정을 공유한다."""
+        def build_attention() -> MultiHeadAttention:
+            """세 어텐션 모듈이 동일한 설정을 공유한다."""
             return MultiHeadAttention(
                 d_model=m.d_model,
                 n_heads=m.n_heads,
                 attention_dropout=m.attention_dropout,
-                qkv_bias=a.qkv_bias,
-                attention_scaling=a.attention_scaling,
-                attention_type=a.attention_type,
-                causal=causal,
-                store_attention=a.store_attention,
+                bias=m.bias,
+                store_attention=m.store_attention,
             )
 
-        # self-attention은 둘 중 하나의 플래그가 요청하면 causal이 된다;
-        # 디코더는 추가로 명시적인 causal 마스크를 만들기 때문에
-        # (models/transformer.py), 여기서 `a.causal`은 주로 디코더 전용
-        # 재사용을 위한 것이다.
-        self.self_attention = build_attention(causal=a.causal)
-        self.cross_attention = build_attention(causal=False)  # 텍스트 cross-attention
+        # causal 제약은 models/transformer.py가 명시적인 마스크로 넘긴다.
+        self.self_attention = build_attention()
+        self.cross_attention = build_attention()  # 텍스트 cross-attention
         self.feed_forward = PositionwiseFeedForward(
             d_model=m.d_model,
             dim_feedforward=m.dim_feedforward,
@@ -102,16 +96,16 @@ class DecoderLayer(nn.Module):
             activation=m.activation,
             bias=m.bias,
         )
-        self.self_attention_norm = LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
-        self.cross_attention_norm = LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
-        self.feed_forward_norm = LayerNorm(m.d_model, eps=m.layer_norm_eps, bias=m.bias)
-        self.residual_dropout = nn.Dropout(m.residual_dropout)
+        self.self_attention_norm = LayerNorm(m.d_model, bias=m.bias)
+        self.cross_attention_norm = LayerNorm(m.d_model, bias=m.bias)
+        self.feed_forward_norm = LayerNorm(m.d_model, bias=m.bias)
+        self.residual_dropout = nn.Dropout(m.dropout)
 
         # ---------------------------------------------- Multimodal 확장 (옵션)
         # use_image일 때만 이미지 cross-attention과 fusion을 만든다; 그래야
         # 텍스트-only 체크포인트의 state_dict가 그대로 유지된다.
         if self.use_image:
-            self.image_cross_attention = build_attention(causal=False)
+            self.image_cross_attention = build_attention()
             self.fusion = build_fusion(mm.fusion_type, m.d_model, mm)
 
     def _cross_attend(

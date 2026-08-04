@@ -77,12 +77,12 @@ def build_optimizer(model: nn.Module, config: OptimizationConfig) -> torch.optim
     betas = tuple(config.betas)
     if config.optimizer == "adam":
         return torch.optim.Adam(
-            params, lr=config.learning_rate, betas=betas, eps=config.eps,
+            params, lr=config.learning_rate, betas=betas,
             weight_decay=config.weight_decay,
         )
     if config.optimizer == "adamw":
         return torch.optim.AdamW(
-            params, lr=config.learning_rate, betas=betas, eps=config.eps,
+            params, lr=config.learning_rate, betas=betas,
             weight_decay=config.weight_decay,
         )
     if config.optimizer == "sgd":

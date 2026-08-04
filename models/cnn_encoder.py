@@ -36,6 +36,7 @@ import torch
 from torch import Tensor, nn
 
 from config.config import Config
+from models.vit_encoder import IMAGE_CHANNELS
 
 
 class _ResidualBlock(nn.Module):
@@ -105,7 +106,7 @@ class CNNEncoder(nn.Module):
 
         # -------------------------------------------------- Stem (해상도 1/4)
         self.stem = nn.Sequential(
-            nn.Conv2d(mm.image_channels, channels[0], kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv2d(IMAGE_CHANNELS, channels[0], kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(channels[0]),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
@@ -136,7 +137,7 @@ class CNNEncoder(nn.Module):
         self.position_embedding = nn.Parameter(
             torch.zeros(1, self.num_patches, m.d_model)
         )
-        self.embedding_dropout = nn.Dropout(m.embedding_dropout)
+        self.embedding_dropout = nn.Dropout(m.dropout)
 
     def forward(self, image: Tensor) -> Tensor:
         """이미지 배치를 공간 feature 시퀀스로 인코딩한다.

@@ -21,7 +21,7 @@
       - constant: warm-up 0 -> 1, 이후 1로 유지.
       - linear  : warm-up 0 -> 1, 이후 min_lr/base_lr까지 선형 decay.
       - cosine  : warm-up 0 -> 1, 이후 min_lr/base_lr까지 half-cosine
-                  decay. (`cosine_decay: false`면 warm-up 이후 1로 고정.)
+                  decay. (decay 없이 고정하려면 scheduler: constant를 쓴다.)
       - noam    : "Attention Is All You Need"의 역제곱근(inverse-sqrt)
                   스케줄을, 최댓값(step == warmup_steps 시점)이 1이 되도록
                   정규화한 것 — 이렇게 하면 다른 모든 스케줄러와 마찬가지로
@@ -70,17 +70,13 @@ def _linear_factory(warmup: int, total_steps: int, floor: float) -> Callable[[in
     return factor
 
 
-def _cosine_factory(
-    warmup: int, total_steps: int, floor: float, decay: bool
-) -> Callable[[int], float]:
-    """warm-up 후 ``floor``까지 half-cosine decay (decay가 아니면 고정)."""
+def _cosine_factory(warmup: int, total_steps: int, floor: float) -> Callable[[int], float]:
+    """warm-up 후 ``floor``까지 half-cosine decay."""
 
     def factor(step: int) -> float:
         step = max(1, step)
         if step < warmup:
             return step / max(1, warmup)
-        if not decay:
-            return 1.0
         progress = min(1.0, (step - warmup) / max(1, total_steps - warmup))
         cosine = 0.5 * (1.0 + math.cos(math.pi * progress))  # 1 -> 0
         return floor + (1.0 - floor) * cosine
@@ -124,7 +120,7 @@ def build_scheduler(
     elif config.scheduler == "linear":
         factor = _linear_factory(warmup, total_steps, floor)
     elif config.scheduler == "cosine":
-        factor = _cosine_factory(warmup, total_steps, floor, decay=config.cosine_decay)
+        factor = _cosine_factory(warmup, total_steps, floor)
     elif config.scheduler == "noam":
         factor = _noam_factory(warmup)
     else:

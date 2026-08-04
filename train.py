@@ -21,8 +21,7 @@
     - 어휘집이 현실을 정의한다: 모델을 만들기 *전에* vocab.en / vocab.de
       크기가 model.src_vocab_size / tgt_vocab_size로 설정되므로, 설정
       오타가 임베딩 크기를 어긋나게 만들 수 없다.
-    - 언어별 분리 어휘집이므로 share_embedding이 켜져 있으면 경고 후
-      자동으로 끈다 (내용이 다른 두 어휘집은 공유가 무의미하다).
+    - 언어별 분리 어휘집이므로 소스/타겟 임베딩은 항상 별도다.
     - CrossEntropyLoss(ignore_index=pad, label smoothing)와 teacher
       forcing(입력 [BOS..yn] -> 타겟 [y1..EOS])은 Trainer/collate에 이미
       구현되어 있다.
@@ -122,10 +121,6 @@ def main() -> None:
     config.model.tgt_vocab_size = len(tgt_vocab)
     config.model.vocab_size = max(len(src_vocab), len(tgt_vocab))
     config.model.pad_token_id = src_vocab.pad_id  # 양쪽 모두 0
-    if config.model.share_embedding:
-        # 언어별 분리 어휘집: 내용이 다르므로 임베딩 공유가 무의미하다.
-        logger.warning("Separate per-language vocabularies — disabling share_embedding")
-        config.model.share_embedding = False
     config.validate()
 
     model = Transformer(config).to(device)
